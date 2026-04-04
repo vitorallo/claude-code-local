@@ -1,4 +1,4 @@
-# claude-code-local
+# Claude-Code-Local
 
 **The only setup that actually works.** Run Claude Code with local LLMs on Apple Silicon — real tool execution, real agentic loops, fully offline.
 
@@ -35,7 +35,7 @@ create a file called /tmp/test_tools.txt with "hello world"
 ```
 
 **Working**: Claude Code calls the Write tool, creates the file, confirms.
-**Broken**: Claude Code generates text saying it created the file, but nothing exists on disk.
+**Broken**: Claude Code generates text saying it created the file, but nothing exists on disk. 
 
 ## Models
 
@@ -45,10 +45,10 @@ create a file called /tmp/test_tools.txt with "hello world"
 | `--review` | GLM-4.7-Flash | ~16.9GB | 24GB+ | Stronger reasoning, single-request only |
 | `--coder` | Qwen3-Coder-30B-A3B | ~17.5GB | 24GB+ | Code generation |
 | `--35b` | Qwen3.5-35B-A3B | ~22GB | 32GB+ | Needs 32GB, swaps on 24GB |
-| `--model ID` | Any MLX model | varies | varies | Custom HuggingFace model ID |
+| `--model ID` | Any MLX model | varies | varies | Custom HuggingFace model ID (this is not tested)|
 
 ```bash
-cclocal                # Default: Qwen3.5-9B
+cclocal                # Default: Qwen3.5-9B, it will lauch everything in one command including claude code
 cclocal --review       # GLM-4.7-Flash
 cclocal --coder        # Qwen3-Coder-30B-A3B
 cclocal --server       # Start server only, connect Claude Code separately

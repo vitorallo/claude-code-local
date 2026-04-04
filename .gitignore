@@ -1,2 +1,5 @@
 server.log
 .DS_Store
+article.*
+CLAUDE.md
+.claude/
