@@ -1,6 +1,7 @@
 server.log
 .DS_Store
 .venv/
+foil-migration.md
 article.*
 CLAUDE.md
 .claude/
