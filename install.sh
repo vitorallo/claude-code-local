@@ -2,6 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+VENV_DIR="$SCRIPT_DIR/.venv"
 
 echo "=== claude-code-local setup ==="
 echo ""
@@ -18,7 +19,7 @@ if ! command -v claude &>/dev/null; then
 fi
 
 # 1. Check/install uv
-echo "[1/4] Checking uv..."
+echo "[1/3] Checking uv..."
 if ! command -v uv &>/dev/null; then
     echo "  Installing uv via brew..."
     if ! command -v brew &>/dev/null; then
@@ -29,61 +30,34 @@ if ! command -v uv &>/dev/null; then
 fi
 echo "  uv: $(uv --version)"
 
-# 2. Install vllm-mlx
+# 2. Create venv and install vllm-mlx
+# Using vitorallo/vllm-mlx fork — claude-code-local-patches branch adds:
+# - All foil-patches-rebased patches (memory warning, /v1/reset, Qwen thinking strip)
+# - Gemma 4 asymmetric channel token stripping (for VLLM_MLX_ENABLE_THINKING=false)
+# See fork README for details.
+VLLM_MLX_REPO="git+https://github.com/vitorallo/vllm-mlx.git@claude-code-local-patches"
 echo ""
-echo "[2/4] Installing vllm-mlx..."
-uv tool install git+https://github.com/waybarrios/vllm-mlx.git || {
-    echo "  Trying upgrade instead..."
-    uv tool upgrade vllm-mlx || true
-}
-echo "  Verifying installation..."
-if command -v vllm-mlx &>/dev/null; then
-    echo "  vllm-mlx installed successfully"
+echo "[2/3] Installing vllm-mlx into local venv..."
+if [[ -d "$VENV_DIR" ]]; then
+    echo "  Upgrading existing venv..."
+    uv pip install --python "$VENV_DIR/bin/python3" --upgrade --force-reinstall "$VLLM_MLX_REPO"
 else
-    echo "  WARNING: vllm-mlx not found in PATH. You may need to restart your shell."
+    echo "  Creating venv..."
+    uv venv "$VENV_DIR"
+    uv pip install --python "$VENV_DIR/bin/python3" "$VLLM_MLX_REPO"
+fi
+if [[ -x "$VENV_DIR/bin/vllm-mlx" ]]; then
+    echo "  vllm-mlx installed: $VENV_DIR/bin/vllm-mlx"
+    MLXLM_VER=$("$VENV_DIR/bin/python3" -c "import mlx_lm; print(mlx_lm.__version__)" 2>/dev/null || echo "unknown")
+    echo "  mlx-lm version: $MLXLM_VER"
+else
+    echo "  ERROR: vllm-mlx binary not found in venv."
+    exit 1
 fi
 
-# 3. Patch vllm-mlx bug (missing return statement in load_model_with_fallback)
-# See vllm-mlx-bug-report.md for details. This checks before patching — skip if already fixed.
+# 3. Create cclocal symlink
 echo ""
-echo "[3/4] Checking vllm-mlx for known bugs..."
-VLLM_BIN=$(which vllm-mlx 2>/dev/null || true)
-if [[ -n "$VLLM_BIN" ]]; then
-    # Resolve the actual package directory from the binary's symlink/shim
-    VLLM_PKG_DIR=$(python3 -c "import importlib.util; spec = importlib.util.find_spec('vllm_mlx'); print(spec.submodule_search_locations[0] if spec else '')" 2>/dev/null || true)
-fi
-TOKENIZER_PY=""
-if [[ -n "${VLLM_PKG_DIR:-}" && -d "$VLLM_PKG_DIR" ]]; then
-    TOKENIZER_PY=$(find "$VLLM_PKG_DIR" -name "tokenizer.py" -path "*/utils/tokenizer.py" 2>/dev/null | head -1)
-fi
-# Fallback to default uv tools location
-if [[ -z "$TOKENIZER_PY" ]]; then
-    TOKENIZER_PY=$(find ~/.local/share/uv/tools/vllm-mlx -name "tokenizer.py" -path "*/utils/tokenizer.py" 2>/dev/null | head -1)
-fi
-if [[ -n "$TOKENIZER_PY" ]]; then
-    # Check if the bug exists: load() succeeds but no return statement follows
-    if grep -A1 'model, tokenizer = load(model_name' "$TOKENIZER_PY" | grep -q 'return model, tokenizer'; then
-        echo "  vllm-mlx tokenizer.py already patched (or fixed upstream)"
-    else
-        echo "  Applying patch: missing 'return model, tokenizer' in load_model_with_fallback()"
-        sed -i.bak 's/\(        model, tokenizer = load(model_name, tokenizer_config=tokenizer_config)\)/\1\n        return model, tokenizer/' "$TOKENIZER_PY"
-        rm -f "${TOKENIZER_PY}.bak"
-        # Verify the patch applied
-        if grep -A1 'model, tokenizer = load(model_name' "$TOKENIZER_PY" | grep -q 'return model, tokenizer'; then
-            echo "  Patched successfully. See vllm-mlx-bug-report.md for details."
-        else
-            echo "  WARNING: Patch may not have applied correctly."
-            echo "  If vllm-mlx crashes on startup, apply manually. See vllm-mlx-bug-report.md."
-        fi
-    fi
-else
-    echo "  WARNING: Could not find vllm-mlx tokenizer.py to check for bugs."
-    echo "  If vllm-mlx crashes on startup, see vllm-mlx-bug-report.md for the fix."
-fi
-
-# 4. Create cclocal symlink
-echo ""
-echo "[4/4] Creating cclocal command..."
+echo "[3/3] Creating cclocal command..."
 mkdir -p ~/.local/bin
 ln -sf "$SCRIPT_DIR/run.sh" ~/.local/bin/cclocal
 echo "  Symlinked: ~/.local/bin/cclocal -> $SCRIPT_DIR/run.sh"

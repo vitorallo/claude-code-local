@@ -18,7 +18,7 @@ No API key. No cloud. No subscription. No data leaves your machine. Just `./inst
 ## Quick start
 
 ```bash
-git clone https://github.com/YOUR_USER/claude-code-local.git
+git clone https://github.com/vitorallo/claude-code-local.git
 cd claude-code-local
 ./install.sh
 cclocal
@@ -44,17 +44,28 @@ create a file called /tmp/test_tools.txt with "hello world"
 | *(default)* | Qwen3.5-9B | ~5GB | 16GB+ | Proven working, huge context headroom |
 | `--review` | GLM-4.7-Flash | ~16.9GB | 24GB+ | Stronger reasoning, single-request only |
 | `--coder` | Qwen3-Coder-30B-A3B | ~17.5GB | 24GB+ | Code generation |
+| `--gemma-light` | Gemma-4-E4B | ~5GB | 16GB+ | EXPERIMENTAL — thinking/tool issues |
+| `--gemma` | Gemma-4-26B-A4B MoE | ~16GB | 24GB+ | EXPERIMENTAL — thinking/tool issues |
 | `--35b` | Qwen3.5-35B-A3B | ~22GB | 32GB+ | Needs 32GB, swaps on 24GB |
-| `--model ID` | Any MLX model | varies | varies | Custom HuggingFace model ID (this is not tested)|
+| `--model ID` | Any MLX model | varies | varies | Custom HuggingFace model ID (not tested) |
 
 ```bash
-cclocal                # Default: Qwen3.5-9B, it will lauch everything in one command including claude code
-cclocal --review       # GLM-4.7-Flash
-cclocal --coder        # Qwen3-Coder-30B-A3B
+cclocal                # Interactive menu: pick model, see what's cached, manage cache
+cclocal --light        # Direct launch, Qwen3.5-9B (default working model)
+cclocal --gemma-light  # Direct launch, Gemma-4-E4B
+cclocal --gemma        # Direct launch, Gemma-4-26B MoE
+cclocal --review       # Direct launch, GLM-4.7-Flash
+cclocal --coder        # Direct launch, Qwen3-Coder-30B-A3B
+cclocal --list         # List cached models on disk
+cclocal --rm           # Manage/delete cached models (interactive)
 cclocal --server       # Start server only, connect Claude Code separately
-cclocal --clean        # List and delete cached models
 cclocal -h             # Show all options
 ```
+
+Running `cclocal` with no arguments opens an interactive menu that shows every
+supported model, indicates which are already cached on disk, and lets you pick
+one or jump to a cache management screen. Use the model flags to skip the menu
+when you already know what you want.
 
 ### Server-only mode
 
@@ -94,9 +105,9 @@ Running Claude Code with a local model isn't just "point it at localhost". There
 
 ### 3. Reasoning/thinking tokens (garbage output)
 
-**Problem**: Qwen 3.x models emit `<think>...</think>` blocks. Claude Code doesn't expect these — causes garbage output and misparses tool calls.
+**Problem**: Qwen 3.x and Gemma 4 models emit thinking/reasoning tokens. Claude Code doesn't expect these — causes garbage output and misparses tool calls.
 
-**Solution**: MLX 4-bit quantized models default to thinking off.
+**Solution**: `run.sh` sets `VLLM_MLX_ENABLE_THINKING=false` on the server, which passes `enable_thinking=False` to the chat template. This suppresses thinking tokens at the template level for all models.
 
 ### 4. KV cache invalidation (90% slowdown)
 
@@ -120,7 +131,7 @@ Running Claude Code with a local model isn't just "point it at localhost". There
 
 **Problem**: Claude Code fires concurrent requests (main + background + subagents). Two concurrent 24K+ token prompts exceed the Metal GPU buffer limit on 24GB and crash the server.
 
-**Solution**: Run in single-request mode (no `--continuous-batching`). Requests serialize instead of competing for Metal memory.
+**Solution**: Run in single-request mode (no `--continuous-batching`). Requests serialize instead of competing for Metal memory. Additionally, `--kv-cache-quantization` halves KV cache memory usage, giving more headroom before OOM.
 
 ### 8. Streaming format mismatches (partial responses)
 
@@ -162,19 +173,21 @@ DISABLE_ERROR_REPORTING=1
 | Model | Size | Free RAM | Status |
 |-------|------|----------|--------|
 | **Qwen3.5-9B** | **~5GB** | **~19GB** | **Working — full tool loop** |
+| Gemma-4-E4B | ~5GB | ~19GB | Lightweight, needs mlx-lm >= 0.31.2 |
+| Gemma-4-26B-A4B MoE | ~16GB | ~8GB | Fast inference, tight on 24GB |
 | GLM-4.7-Flash | ~16.9GB | ~7GB | Works single-request only |
 | Qwen3.5-35B-A3B | ~22GB | ~2GB | Swaps to death |
 
-### 13. vllm-mlx critical bug: missing `return` statement
+### 13. vllm-mlx critical bug: missing `return` statement (historical)
 
-**Problem**: `vllm-mlx serve` crashes on startup with any model:
+**Problem**: Earlier versions of `vllm-mlx serve` crashed on startup with any model:
 ```
 TypeError: cannot unpack non-iterable NoneType object
 ```
 
-In `vllm_mlx/utils/tokenizer.py`, the function `load_model_with_fallback()` is missing a `return` statement on the success path.
+In `vllm_mlx/utils/tokenizer.py`, the function `load_model_with_fallback()` was missing a `return` statement on the success path.
 
-**Solution**: `install.sh` automatically detects and patches this bug. If the upstream fix has been merged, the patch is skipped. See [vllm-mlx-bug-report.md](vllm-mlx-bug-report.md) for details.
+**Solution**: Fixed upstream and present in our fork. `install.sh` installs from [vitorallo/vllm-mlx@foil-patches-rebased](https://github.com/vitorallo/vllm-mlx/tree/foil-patches-rebased) which has the fix and a few other patches for Claude Code compatibility.
 
 ### 14. Health endpoint mismatch
 
@@ -194,7 +207,7 @@ In `vllm_mlx/utils/tokenizer.py`, the function `load_model_with_fallback()` is m
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| vllm-mlx crashes on startup (TypeError: NoneType) | Missing return bug | Run `./install.sh` to auto-patch, or see [#13](#13-vllm-mlx-critical-bug-missing-return-statement) |
+| vllm-mlx crashes on startup (TypeError: NoneType) | Using unpatched upstream | `./install.sh` installs from our fork which has the fix |
 | Model generates text about tools but nothing executes | Using Ollama | Switch to vllm-mlx — Ollama can't produce real tool_use blocks |
 | Metal GPU OOM | Model too large for concurrent requests | Use default model (9B) or accept single-request mode |
 | Claude Code asks about "detected custom API key" | Real API key leaking | Use `cclocal` which unsets real keys |
@@ -222,6 +235,17 @@ In `vllm_mlx/utils/tokenizer.py`, the function `load_model_with_fallback()` is m
 | `DISABLE_ERROR_REPORTING` | `1` | No error reporting |
 | `DISABLE_NON_ESSENTIAL_MODEL_CALLS` | `1` | Reduce background model calls |
 
+### vllm-mlx server flags (set by run.sh)
+
+| Flag | Purpose |
+|------|---------|
+| `VLLM_MLX_ENABLE_THINKING=false` | Disable thinking/reasoning tokens |
+| `--kv-cache-quantization` | 8-bit KV cache — halves cache memory usage |
+| `--cache-memory-percent 0.35` | 35% of RAM for cache (~8.4GB on 24GB) |
+| `--prefill-step-size 4096` | Faster time-to-first-token on large prompts |
+| `--stream-interval 4` | Batch 4 tokens before streaming for throughput |
+| `--timeout 600` | 10 min timeout (default 300s caused disconnects) |
+
 ### Claude Code flags (set by run.sh)
 
 | Flag | Purpose |
@@ -237,9 +261,9 @@ In `vllm_mlx/utils/tokenizer.py`, the function `load_model_with_fallback()` is m
 ```
 claude-code-local/
   run.sh                    # Launcher — starts vllm-mlx + Claude Code
-  install.sh                # Setup — installs vllm-mlx, patches bugs, creates cclocal command
+  install.sh                # Setup — creates .venv, installs vllm-mlx, patches bugs, creates cclocal
   mcp-local.json            # Empty MCP config (strips plugins for local sessions)
-  vllm-mlx-bug-report.md    # Upstream bug report for the missing return fix
+  .venv/                    # Local Python venv with vllm-mlx (created by install.sh)
   .gitignore
   README.md
 ```

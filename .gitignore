@@ -1,5 +1,6 @@
 server.log
 .DS_Store
+.venv/
 article.*
 CLAUDE.md
 .claude/
