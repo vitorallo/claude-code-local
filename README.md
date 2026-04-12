@@ -41,18 +41,30 @@ create a file called /tmp/test_tools.txt with "hello world"
 
 | Flag | Model | Size | RAM needed | Notes |
 |------|-------|------|-----------|-------|
-| *(default)* | Qwen3.5-9B | ~5GB | 16GB+ | Proven working, huge context headroom |
-| `--review` | GLM-4.7-Flash | ~16.9GB | 24GB+ | Stronger reasoning, single-request only |
-| `--coder` | Qwen3-Coder-30B-A3B | ~17.5GB | 24GB+ | Code generation |
-| `--gemma-light` | Gemma-4-E4B | ~5GB | 16GB+ | EXPERIMENTAL — thinking/tool issues |
-| `--gemma` | Gemma-4-26B-A4B MoE | ~16GB | 24GB+ | EXPERIMENTAL — thinking/tool issues |
-| `--35b` | Qwen3.5-35B-A3B | ~22GB | 32GB+ | Needs 32GB, swaps on 24GB |
+| *(default)* `--gemma-light` | Gemma-4-E4B | ~5GB | 16GB+ | Clean tool calling, verified end-to-end |
+| `--gemma` | Gemma-4-26B-A4B MoE | ~16GB | 24GB+ | Google MoE, 3.8B active params |
+| `--review` | GLM-4.7-Flash | ~17GB | 24GB+ | Stronger reasoning |
+| `--coder` | Qwen3-Coder-30B-A3B | ~18GB | 24GB+ | Heavier code model |
+| `--qwen3` | Qwen3.5-9B | ~5GB | 16GB+ | General reasoning — leaks plain-text thinking [1] |
+| `--coder7b` | Qwen2.5-Coder-7B | ~5GB | 16GB+ | Code analysis — tool calls unreliable [2] |
+| `--light` | *(alias)* | | | Back-compat alias for `--gemma-light` (v2.0.1 pointed at Qwen3.5-9B) |
 | `--model ID` | Any MLX model | varies | varies | Custom HuggingFace model ID (not tested) |
+
+[1] Qwen3.5 is a hybrid-thinking model that ignores `enable_thinking=false` at
+the template level and emits plain-text "Thinking Process:" preamble outside
+`<think>` tags. Known upstream issue; see
+[vllm-project/vllm#35574](https://github.com/vllm-project/vllm/issues/35574)
+and [QwenLM/Qwen3#1625](https://github.com/QwenLM/Qwen3/issues/1625). Use
+only if you want general reasoning and tolerate verbose output.
+
+[2] Qwen2.5-Coder-7B hallucinates an XML tool-call format
+(`<Write path="..." content="..."/>`) that no parser handles. Good for
+non-agentic code analysis where you feed it whole files, not for Claude
+Code's tool loop. Use `--gemma-light` for tool calling work instead.
 
 ```bash
 cclocal                # Interactive menu: pick model, see what's cached, manage cache
-cclocal --light        # Direct launch, Qwen3.5-9B (default working model)
-cclocal --gemma-light  # Direct launch, Gemma-4-E4B
+cclocal --gemma-light  # Direct launch, Gemma-4-E4B (default, clean tool calling)
 cclocal --gemma        # Direct launch, Gemma-4-26B MoE
 cclocal --review       # Direct launch, GLM-4.7-Flash
 cclocal --coder        # Direct launch, Qwen3-Coder-30B-A3B
@@ -78,7 +90,7 @@ Then connect Claude Code from any terminal:
 ```bash
 ANTHROPIC_BASE_URL=http://127.0.0.1:8000 \
 ANTHROPIC_API_KEY=not-needed \
-ANTHROPIC_MODEL=mlx-community/Qwen3.5-9B-MLX-4bit \
+ANTHROPIC_MODEL=mlx-community/gemma-4-e4b-it-4bit \
 claude --strict-mcp-config --mcp-config /path/to/claude-code-local/mcp-local.json \
   --tools "Bash,Read,Edit,Write,Glob,Grep,WebSearch,WebFetch"
 ```
@@ -172,11 +184,11 @@ DISABLE_ERROR_REPORTING=1
 
 | Model | Size | Free RAM | Status |
 |-------|------|----------|--------|
-| **Qwen3.5-9B** | **~5GB** | **~19GB** | **Working — full tool loop** |
-| Gemma-4-E4B | ~5GB | ~19GB | Lightweight, needs mlx-lm >= 0.31.2 |
+| **Gemma-4-E4B** | **~5GB** | **~19GB** | **Default — verified tool loop** |
+| Qwen3.5-9B | ~5GB | ~19GB | Works but leaks plain-text thinking |
+| Qwen2.5-Coder-7B | ~5GB | ~19GB | Code analysis only — tool calls unreliable |
 | Gemma-4-26B-A4B MoE | ~16GB | ~8GB | Fast inference, tight on 24GB |
 | GLM-4.7-Flash | ~16.9GB | ~7GB | Works single-request only |
-| Qwen3.5-35B-A3B | ~22GB | ~2GB | Swaps to death |
 
 ### 13. vllm-mlx critical bug: missing `return` statement (historical)
 
@@ -199,7 +211,7 @@ In `vllm_mlx/utils/tokenizer.py`, the function `load_model_with_fallback()` was 
 
 **Problem**: Setting `ANTHROPIC_MODEL=default` causes 404. vllm-mlx requires the full HuggingFace model ID.
 
-**Solution**: `run.sh` passes the full model ID (e.g., `mlx-community/Qwen3.5-9B-MLX-4bit`).
+**Solution**: `run.sh` passes the full model ID (e.g., `mlx-community/gemma-4-e4b-it-4bit`).
 
 ---
 

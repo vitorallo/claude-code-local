@@ -10,44 +10,44 @@ HF_CACHE="$HOME/.cache/huggingface/hub"
 # =============================================================================
 # Parallel arrays: flag / huggingface id / display name / size / description
 MODEL_FLAGS=(
-    "light"
     "gemma-light"
-    "review"
     "gemma"
+    "review"
     "coder"
-    "35b"
+    "qwen3"
+    "coder7b"
 )
 MODEL_IDS=(
-    "mlx-community/Qwen3.5-9B-MLX-4bit"
     "mlx-community/gemma-4-e4b-it-4bit"
-    "mlx-community/GLM-4.7-Flash-4bit"
     "mlx-community/gemma-4-26b-a4b-it-4bit"
+    "mlx-community/GLM-4.7-Flash-4bit"
     "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit"
-    "mlx-community/Qwen3.5-35B-A3B-4bit"
+    "mlx-community/Qwen3.5-9B-MLX-4bit"
+    "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit"
 )
 MODEL_NAMES=(
-    "Qwen3.5-9B"
     "Gemma-4-E4B"
-    "GLM-4.7-Flash"
     "Gemma-4-26B-A4B MoE"
+    "GLM-4.7-Flash"
     "Qwen3-Coder-30B-A3B"
-    "Qwen3.5-35B-A3B"
+    "Qwen3.5-9B"
+    "Qwen2.5-Coder-7B"
 )
 MODEL_SIZES=(
     "5GB"
-    "5GB"
-    "17GB"
     "16GB"
+    "17GB"
     "18GB"
-    "22GB"
+    "5GB"
+    "5GB"
 )
 MODEL_DESCS=(
-    "Default, proven working — 16GB+ RAM"
-    "Google, clean tool calling — 16GB+ RAM"
-    "Stronger reasoning — 24GB+ RAM"
+    "Default, clean tool calling — 16GB+ RAM"
     "Google MoE, 3.8B active — 24GB+ RAM"
-    "Code generation — 24GB+ RAM"
-    "Smartest but swaps on 24GB — 32GB+"
+    "Stronger reasoning — 24GB+ RAM"
+    "Heavier code model — 24GB+ RAM"
+    "General reasoning — verbose thinking leak"
+    "Code analysis — tool calls unreliable"
 )
 
 # =============================================================================
@@ -361,12 +361,13 @@ Without any model flag, cclocal opens an interactive menu to select a model,
 show cached models, and manage the cache. Model flags bypass the menu.
 
 ${BOLD}Model flags${RESET}
-  --light         Qwen3.5-9B (~5GB, default)
-  --gemma-light   Gemma-4-E4B (~5GB)
-  --review        GLM-4.7-Flash (~17GB)
+  --gemma-light   Gemma-4-E4B (~5GB, default, clean tool calling)
   --gemma         Gemma-4-26B-A4B MoE (~16GB)
+  --review        GLM-4.7-Flash (~17GB)
   --coder         Qwen3-Coder-30B-A3B (~18GB)
-  --35b           Qwen3.5-35B-A3B (~22GB)
+  --qwen3         Qwen3.5-9B (~5GB, general reasoning, thinking leak)
+  --coder7b       Qwen2.5-Coder-7B (~5GB, tool calls unreliable)
+  --light         Alias for --gemma-light (back-compat with v2.0.1)
   --model ID      Use a custom HuggingFace MLX model ID
 
 ${BOLD}Commands${RESET}
@@ -383,8 +384,8 @@ ${BOLD}Other${RESET}
 
 ${BOLD}Examples${RESET}
   cclocal                  ${DIM}# interactive menu${RESET}
-  cclocal --light          ${DIM}# direct launch, Qwen3.5-9B${RESET}
-  cclocal --gemma-light    ${DIM}# direct launch, Gemma-4-E4B${RESET}
+  cclocal --gemma-light    ${DIM}# direct launch, Gemma-4-E4B (default)${RESET}
+  cclocal --gemma          ${DIM}# direct launch, Gemma-4-26B MoE${RESET}
   cclocal --list           ${DIM}# show cached models${RESET}
   cclocal --rm             ${DIM}# manage/delete cached models${RESET}
   cclocal --server         ${DIM}# server only, connect Claude Code later${RESET}
@@ -401,8 +402,18 @@ SERVER_ONLY=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --light|--review|--coder|--35b|--gemma|--gemma-light)
+        --coder7b|--review|--coder|--gemma|--gemma-light|--qwen3)
             idx=$(find_by_flag "${1#--}")
+            MODEL="${MODEL_IDS[$idx]}"
+            MODEL_NAME_DISPLAY="${MODEL_NAMES[$idx]}"
+            shift
+            ;;
+        --light)
+            # Backward-compat alias: v2.0.1 default was Qwen3.5-9B which leaks
+            # plain-text thinking. v2.0.2 default is Gemma-4-E4B — clean tool
+            # calling via the fork's gemma4_tool_parser + channel-cleanup
+            # patches.
+            idx=$(find_by_flag "gemma-light")
             MODEL="${MODEL_IDS[$idx]}"
             MODEL_NAME_DISPLAY="${MODEL_NAMES[$idx]}"
             shift
@@ -486,7 +497,7 @@ printf "${DIM}Starting vllm-mlx server (logs: $LOG_FILE)...${RESET}\n"
 # get a smaller cap to avoid OOM under memory pressure.
 CC_OUTPUT_TOKENS="4096"
 case "$MODEL" in
-    *e4b*|*e2b*|*9B*|*3B*)
+    *Coder-7B*|*Coder-3B*|*e4b*|*e2b*|*9B*|*3B*)
         CC_OUTPUT_TOKENS="16384"
         ;;
 esac
