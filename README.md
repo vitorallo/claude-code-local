@@ -289,3 +289,22 @@ claude-code-local/
 - [Why Claude Code Fails with Local LLMs](https://explore.n1n.ai/blog/why-claude-code-fails-local-llm-inference-2026-02-19) — Detailed failure analysis
 - [Claude Code tool flooding issue](https://github.com/anthropics/claude-code/issues/25857) — 259 tools sent to local models
 - [Ollama Anthropic Compatibility](https://docs.ollama.com/api/anthropic-compatibility) — Confirmed broken for tool_use
+
+---
+
+## Citation
+
+This project would not exist without [vllm-mlx](https://github.com/waybarrios/vllm-mlx)
+by Wayner Barrios — the native Apple Silicon MLX backend that makes real
+Anthropic tool-use blocks possible on local hardware. If you use vLLM-MLX in
+your research or project, please cite:
+
+```bibtex
+@software{vllm_mlx2025,
+  author = {Barrios, Wayner},
+  title = {vLLM-MLX: Apple Silicon MLX Backend for vLLM},
+  year = {2025},
+  url = {https://github.com/waybarrios/vllm-mlx},
+  note = {Native GPU-accelerated LLM and vision-language model inference on Apple Silicon}
+}
+```
