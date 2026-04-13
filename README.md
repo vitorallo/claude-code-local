@@ -199,7 +199,7 @@ TypeError: cannot unpack non-iterable NoneType object
 
 In `vllm_mlx/utils/tokenizer.py`, the function `load_model_with_fallback()` was missing a `return` statement on the success path.
 
-**Solution**: Fixed upstream and present in our fork. `install.sh` installs from [vitorallo/vllm-mlx@foil-patches-rebased](https://github.com/vitorallo/vllm-mlx/tree/foil-patches-rebased) which has the fix and a few other patches for Claude Code compatibility.
+**Solution**: Fixed upstream and present in our fork. `install.sh` installs from [vitorallo/vllm-mlx@claude-code-local-patches](https://github.com/vitorallo/vllm-mlx/tree/claude-code-local-patches) which has the fix on top of a rebased `foil-patches-rebased` base, plus Gemma 4 channel-token cleanup patches for Claude Code compatibility (asymmetric `<|channel>thought...<channel|>` handling in both non-streaming and streaming paths).
 
 ### 14. Health endpoint mismatch
 
