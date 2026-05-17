@@ -39,6 +39,9 @@ echo "  uv: $(uv --version)"
 #   --tool-call-truncation-notice (see README #18)
 # claude-code-local-patches itself is intentionally left untouched so other
 # consumers (e.g. foil) are unaffected until/if this branch is merged there.
+#
+# To manually roll back to the base branch, swap the line below for:
+# VLLM_MLX_REPO="git+https://github.com/vitorallo/vllm-mlx.git@claude-code-local-patches"
 VLLM_MLX_REPO="git+https://github.com/vitorallo/vllm-mlx.git@fix/gemma4-toolcall-safe-and-faildloud"
 echo ""
 echo "[2/3] Installing vllm-mlx into local venv..."
