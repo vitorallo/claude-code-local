@@ -667,7 +667,7 @@ CLAUDE_ENV=(
 # that gets truncated and dropped (see README #18). Tell the model up front
 # to write large files in sections so it pre-empts the wall. The fork's
 # --tool-call-truncation-notice (below) is the reactive backstop.
-_WRITE_IN_PARTS_GUIDANCE="You are running on a small, token-capped local model. Apply these rules autonomously, without being asked and without announcing them: (1) Never emit a file create/edit larger than ~80 lines or ~1500 words in a single Write/Edit tool call — an oversized call is truncated and silently dropped. Build large files incrementally: create the file with the first short section, then append each remaining section with its own small Write/Edit call. (2) Before any Write or Edit to a file that may already exist, Read it first — do NOT use ls or cat to check existence. Claude Code rejects writing to an existing file that has not been Read. If unsure, Read first; if it does not exist, just create it. (3) Prefer many small tool calls over one large one; keep each call's content short. (4) Never print the file's contents into the chat — put them only in the file."
+_WRITE_IN_PARTS_GUIDANCE="When creating or substantially editing a file longer than ~150 lines, do NOT emit it in a single Write/Edit tool call. First create the file with an initial section, then append each remaining section with separate, smaller Write/Edit calls. This local model's output is token-capped; an oversized single tool call is truncated and silently dropped."
 
 CLAUDE_FLAGS=(
     --strict-mcp-config
