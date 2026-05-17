@@ -296,6 +296,56 @@ shrink in non-interactive runs, and skips silently if the model size can't be
 estimated. Recovery from a crash: exit the dead Claude session, then relaunch
 with a smaller model (`cclocal --gemma-light`) or with `--safe`.
 
+### 18. Write/Edit tool call silently does nothing (no error)
+
+**Symptom**: The model "calls" a tool to write a file — Claude Code shows the
+tool invocation — then **silence**. No file written, no error. Short-argument
+tools (`Bash ls`) work; large `Write`/`Edit` calls don't. You end up
+copy-pasting the file content out by hand.
+
+**Cause** — three compounding factors, all triggered by *large* tool
+arguments (a `Write` serializes the **entire file body** as output tokens
+inside the tool-call JSON):
+
+1. **Output-token truncation (primary).** `gemma-4-26b` did not match the
+   `CC_OUTPUT_TOKENS` override list, so it ran at the **4096** default. A
+   file write blows past that; generation is cut mid-`content`, the JSON
+   never closes, and no valid `tool_use` block can be built. HTTP 200, no
+   error — Claude just sees text.
+
+2. **Fork channel-filter amplifies truncation.** The custom fork's
+   `_clean_gemma4_channels` (`vllm_mlx/api/utils.py`) handles a truncated
+   Gemma thought block by deleting everything from an unclosed
+   `<|channel>thought` to end-of-text. A tool call truncated mid-stream
+   leaves exactly such an unclosed opener, so the *partial* tool call is
+   **erased entirely** before the parser sees it — turning a possibly
+   recoverable fragment into nothing.
+
+3. **Fork channel-filter content collision (latent).** The same filter is a
+   plain substring/regex pass over the *whole* accumulated text including
+   the file body. If the file being written itself contains
+   `<|channel>thought` / `<|channel>` (realistic for security-review notes,
+   docs, code about LLMs), a *complete* tool call can also be destroyed.
+
+The installed engine is confirmed to be the
+[vitorallo/vllm-mlx fork](https://github.com/vitorallo/vllm-mlx/tree/claude-code-local-patches)
+(not upstream — verified via the venv's `direct_url.json` and the fork-only
+`_clean_gemma4_channels` patch), so this is the fork's behaviour, not a wrong
+dependency.
+
+**Mitigations (in `run.sh`)**:
+- `CC_OUTPUT_TOKENS` default raised **4096 → 8192** for *all* models, with
+  per-run override `--out-tokens N` (use `16384` for big files; pair with
+  `--safe` if a large model then OOMs).
+- `server.log` is now **rotated** to `server.log.1` instead of truncated, so
+  a failed tool-call session can actually be inspected afterward.
+
+**Not yet fixed (fork-side)**: factors 2 and 3 need a patch to
+`_clean_gemma4_channels` (don't strip channel markers that fall *inside* a
+tool-call span / a JSON string). Raising `--out-tokens` reduces factor 1 but
+does not address content-collision. For heavy file-writing, `gemma-light` or
+a coder model is currently more reliable.
+
 ---
 
 ## Troubleshooting
@@ -306,6 +356,7 @@ with a smaller model (`cclocal --gemma-light`) or with `--safe`.
 | Model generates text about tools but nothing executes | Using Ollama | Switch to vllm-mlx — Ollama can't produce real tool_use blocks |
 | Metal GPU OOM crash under load (`kIOGPUCommandBufferCallbackErrorOutOfMemory`) | Large model + growing agentic context exceeds RAM | Take the `memory_preflight` prompt (shrink context / raise GPU limit), or use a 5GB model — see #17 |
 | First run hangs at "Waiting for server..." | Multi-GB model still downloading from HuggingFace | It's not hung — a live download progress line now shows; partial downloads resume — see #16 |
+| Write/Edit tool call shows then silently does nothing (no error) | Large tool-call output truncated by the token cap (+ fork channel-filter) | `--out-tokens 16384`, or use `gemma-light`/a coder model; inspect `server.log.1` — see #18 |
 | Claude Code asks about "detected custom API key" | Real API key leaking | Use `cclocal` which unsets real keys |
 | "Model does not exist" (404) | Wrong model name | Must use full HuggingFace ID, not "default" |
 | Slow responses (30-60s) | Normal for local inference | Context grows each turn — 24K+ tokens at ~8 tok/s |
@@ -323,7 +374,7 @@ with a smaller model (`cclocal --gemma-light`) or with `--safe`.
 | `ANTHROPIC_MODEL` | Full HuggingFace ID | Model identifier |
 | `ANTHROPIC_DEFAULT_*_MODEL` | Same as above | Route all tiers (Opus/Sonnet/Haiku) locally |
 | `CLAUDE_CODE_SUBAGENT_MODEL` | Same as above | Route subagent calls locally |
-| `CLAUDE_CODE_MAX_OUTPUT_TOKENS` | `16384` (9B) / `4096` (large) | Output limit per model size |
+| `CLAUDE_CODE_MAX_OUTPUT_TOKENS` | `8192` default, `--out-tokens N` to override | Output cap; must fit a whole Write/Edit file body (see #18) |
 | `CLAUDE_CODE_ATTRIBUTION_HEADER` | `0` | Prevents KV cache invalidation |
 | `DISABLE_PROMPT_CACHING` | `1` | Local server doesn't support Anthropic caching |
 | `DISABLE_AUTOUPDATER` | `1` | No update checks |
@@ -349,6 +400,7 @@ with a smaller model (`cclocal --gemma-light`) or with `--safe`.
 |------------|---------|
 | `--safe` / `CCLOCAL_FORCE_MEMCHECK=1` | Always show the memory-safeguard menu, for any model (see #17) |
 | `--no-mem-check` / `CCLOCAL_NO_MEMCHECK=1` | Skip the GPU-headroom preflight prompt (see #17) |
+| `--out-tokens N` | Max output tokens Claude Code requests (default 8192; raise to 16384 for large file writes — see #18) |
 | `iogpu.wired_limit_mb` | Optionally raised via `sudo sysctl` by preflight option 2; **per-session only** — reverted on exit (prompts for sudo at shutdown if creds expired), and resets on reboot |
 
 ### Claude Code flags (set by run.sh)

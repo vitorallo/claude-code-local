@@ -479,6 +479,8 @@ ${BOLD}Server options${RESET}
   --port N        Server port (default: 8000)
   --no-mem-check  Skip the RAM-headroom preflight prompt
   --safe          Always show the memory-safeguard menu (force, any model)
+  --out-tokens N  Max output tokens Claude Code requests (default 8192;
+                  raise for large file writes, e.g. 16384)
 
 ${BOLD}Other${RESET}
   -h, --help      Show this help
@@ -528,6 +530,7 @@ while [[ $# -gt 0 ]]; do
         --server)  SERVER_ONLY=true; shift ;;
         --no-mem-check) CCLOCAL_NO_MEMCHECK=1; shift ;;
         --safe)         CCLOCAL_FORCE_MEMCHECK=1; shift ;;
+        --out-tokens)   CC_OUTPUT_TOKENS_OVERRIDE="$2"; shift 2 ;;
         --list|-l)
             print_header
             list_cached_all
@@ -620,20 +623,26 @@ if [[ -n "$existing_pid" ]]; then
     kill -0 $existing_pid 2>/dev/null && kill -9 $existing_pid 2>/dev/null || true
 fi
 
-# Start vllm-mlx server in background
+# Start vllm-mlx server in background.
+# Rotate the previous run's log to server.log.1 instead of truncating, so a
+# crashed/failed session can still be inspected after the next launch.
 LOG_FILE="$SCRIPT_DIR/server.log"
-printf "${DIM}Starting vllm-mlx server (logs: $LOG_FILE)...${RESET}\n"
+[[ -f "$LOG_FILE" ]] && mv -f "$LOG_FILE" "$LOG_FILE.1" 2>/dev/null || true
+printf "${DIM}Starting vllm-mlx server (logs: $LOG_FILE, prev: $LOG_FILE.1)...${RESET}\n"
 
 # CLAUDE_CODE_MAX_OUTPUT_TOKENS — per-request output cap sent by Claude Code.
-# Distinct from vllm-mlx's `--max-tokens` flag below (which is the server-side
-# context window default). Small models get a generous output; large models
-# get a smaller cap to avoid OOM under memory pressure.
-CC_OUTPUT_TOKENS="4096"
-case "$MODEL" in
-    *Coder-7B*|*Coder-3B*|*e4b*|*e2b*|*9B*|*3B*)
-        CC_OUTPUT_TOKENS="16384"
-        ;;
-esac
+# Distinct from vllm-mlx's `--max-tokens` flag below (the server-side context
+# window default).
+#
+# This must be generous: a Write/Edit tool call serializes the ENTIRE file
+# body as output tokens inside the tool-use JSON. The old 4096 truncated the
+# tool call mid-`content`, the JSON never closed, the streaming tool-call
+# parser couldn't build a tool_use block, and the write silently did nothing
+# (no error). 8192 is a balanced default — roughly doubles file-write headroom
+# vs the old 4096 while costing less generation memory than 16384. Override
+# per-run with `--out-tokens N` (e.g. 16384 for big files; pair with `--safe`
+# to raise the GPU limit if a large model OOMs).
+CC_OUTPUT_TOKENS="${CC_OUTPUT_TOKENS_OVERRIDE:-8192}"
 
 # Environment variables passed to Claude Code. Kept as a single array so the
 # --server print-out and the in-process launch cannot drift apart.
