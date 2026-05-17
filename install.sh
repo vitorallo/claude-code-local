@@ -31,11 +31,15 @@ fi
 echo "  uv: $(uv --version)"
 
 # 2. Create venv and install vllm-mlx
-# Using vitorallo/vllm-mlx fork — claude-code-local-patches branch adds:
+# Using vitorallo/vllm-mlx fork. Pinned to the fix/gemma4-toolcall-safe-and-faildloud
+# branch (built on claude-code-local-patches) which adds, on top of the base:
 # - All foil-patches-rebased patches (memory warning, /v1/reset, Qwen thinking strip)
 # - Gemma 4 asymmetric channel token stripping (for VLLM_MLX_ENABLE_THINKING=false)
-# See fork README for details.
-VLLM_MLX_REPO="git+https://github.com/vitorallo/vllm-mlx.git@claude-code-local-patches"
+# - Tool-call-span-safe channel cleaning (D1/D2) + opt-in
+#   --tool-call-truncation-notice (see README #18)
+# claude-code-local-patches itself is intentionally left untouched so other
+# consumers (e.g. foil) are unaffected until/if this branch is merged there.
+VLLM_MLX_REPO="git+https://github.com/vitorallo/vllm-mlx.git@fix/gemma4-toolcall-safe-and-faildloud"
 echo ""
 echo "[2/3] Installing vllm-mlx into local venv..."
 if [[ -d "$VENV_DIR" ]]; then
