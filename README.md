@@ -271,9 +271,12 @@ Choose [1/2/3/c/q] (Enter = 1):
 - **Option 1** lowers the server-side context window (`--max-tokens`), which
   is the single biggest KV-cache saver.
 - **Option 2** raises the Metal GPU wired-memory limit via
-  `sudo sysctl iogpu.wired_limit_mb=<RAM−3GB>`. This is intentionally **not**
-  persisted across reboots — it resets to the macOS default on restart, which
-  is the desired behaviour (a temporary, per-session bump).
+  `sudo sysctl iogpu.wired_limit_mb=<RAM−3GB>`. It is strictly a temporary,
+  per-session bump: the original value is captured and **automatically
+  reverted on exit** (best-effort via `sudo -n`; if the sudo credentials have
+  expired by shutdown it prints the one-line command to restore manually).
+  It is also intentionally **not** persisted across reboots — macOS resets it
+  to the default on restart regardless.
 - If the GPU limit is already at/above the recommended value, option 2 is
   shown as "already fine" instead of being offered.
 
@@ -336,7 +339,7 @@ smaller model (`cclocal --gemma-light`).
 | Flag / env | Purpose |
 |------------|---------|
 | `--no-mem-check` / `CCLOCAL_NO_MEMCHECK=1` | Skip the RAM-headroom preflight prompt (see #17) |
-| `iogpu.wired_limit_mb` | Optionally raised via `sudo sysctl` by preflight option 2; **per-session only**, resets on reboot |
+| `iogpu.wired_limit_mb` | Optionally raised via `sudo sysctl` by preflight option 2; **per-session only** — auto-reverted on exit, and resets on reboot |
 
 ### Claude Code flags (set by run.sh)
 

@@ -361,11 +361,16 @@ manage_cached_models() {
 # for a large context is what OOM-crashes Metal on tight machines.
 VLLM_MAX_TOKENS=32768
 
+# Set by _raise_wired_limit to the pre-change value so cleanup() can revert it.
+WIRED_RESTORE=""
+
 _raise_wired_limit() {
-    local target=$1
+    local target=$1 orig
+    orig=$(sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo 0)
     printf "  Raising Metal GPU wired limit to ${target}MB ${DIM}(sudo — may prompt)${RESET}...\n"
     if sudo sysctl iogpu.wired_limit_mb="$target" >/dev/null 2>&1; then
-        printf "  ${GREEN}Set.${RESET} ${DIM}Resets to default on reboot.${RESET}\n"
+        WIRED_RESTORE="$orig"
+        printf "  ${GREEN}Set.${RESET} ${DIM}Auto-restored to ${orig} on exit (also resets on reboot).${RESET}\n"
     else
         printf "  ${RED}Could not set it${RESET} — continuing without the bump.\n"
     fi
@@ -560,6 +565,31 @@ if ! is_cached "$MODEL"; then
 fi
 echo ""
 
+# Cleanup on exit: revert a sudo'd Metal GPU limit and stop the server.
+# Armed BEFORE memory_preflight so the limit is always restored even if the
+# launch aborts before the server starts.
+cleanup() {
+    if [[ -n "${WIRED_RESTORE:-}" ]]; then
+        printf "\n${DIM}Restoring Metal GPU wired limit to ${WIRED_RESTORE}...${RESET}\n"
+        if sudo -n sysctl iogpu.wired_limit_mb="$WIRED_RESTORE" >/dev/null 2>&1; then
+            printf "${DIM}Restored.${RESET}\n"
+        else
+            printf "${YELLOW}Could not auto-restore${RESET} (sudo credentials expired). Run:\n"
+            printf "  ${DIM}sudo sysctl iogpu.wired_limit_mb=${WIRED_RESTORE}${RESET}\n"
+            printf "${DIM}(It also resets to the macOS default on reboot.)${RESET}\n"
+        fi
+        WIRED_RESTORE=""
+    fi
+    if [[ -n "${SERVER_PID:-}" ]]; then
+        echo ""
+        printf "${DIM}Shutting down vllm-mlx server (pid: $SERVER_PID)...${RESET}\n"
+        kill $SERVER_PID 2>/dev/null || true
+        wait $SERVER_PID 2>/dev/null || true
+        printf "${DIM}Done.${RESET}\n"
+    fi
+}
+trap cleanup EXIT
+
 memory_preflight
 
 # Kill any existing process on the port
@@ -631,16 +661,8 @@ VLLM_MLX_ENABLE_THINKING=false \
     --tool-call-parser auto \
     > "$LOG_FILE" 2>&1 &
 SERVER_PID=$!
-
-# Cleanup on exit
-cleanup() {
-    echo ""
-    printf "${DIM}Shutting down vllm-mlx server (pid: $SERVER_PID)...${RESET}\n"
-    kill $SERVER_PID 2>/dev/null || true
-    wait $SERVER_PID 2>/dev/null || true
-    printf "${DIM}Done.${RESET}\n"
-}
-trap cleanup EXIT
+# cleanup()/trap are armed earlier (before memory_preflight) so a sudo'd GPU
+# limit is reverted even if the launch fails before the server starts.
 
 # Wait for server to be ready.
 # First run downloads the model from HuggingFace into $HF_CACHE, which can take
