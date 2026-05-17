@@ -662,10 +662,18 @@ CLAUDE_ENV=(
     "DISABLE_ERROR_REPORTING=1"
     "DISABLE_NON_ESSENTIAL_MODEL_CALLS=1"
 )
+# Proactive guidance: a local model's output is token-capped, and an
+# oversized single Write/Edit serializes the whole file into one tool call
+# that gets truncated and dropped (see README #18). Tell the model up front
+# to write large files in sections so it pre-empts the wall. The fork's
+# --tool-call-truncation-notice (below) is the reactive backstop.
+_WRITE_IN_PARTS_GUIDANCE="When creating or substantially editing a file longer than ~150 lines, do NOT emit it in a single Write/Edit tool call. First create the file with an initial section, then append each remaining section with separate, smaller Write/Edit calls. This local model's output is token-capped; an oversized single tool call is truncated and silently dropped."
+
 CLAUDE_FLAGS=(
     --strict-mcp-config
     --mcp-config "$MCP_CONFIG"
     --tools "Bash,Read,Edit,Write,Glob,Grep,WebSearch,WebFetch"
+    --append-system-prompt "$_WRITE_IN_PARTS_GUIDANCE"
 )
 
 # Disable thinking/reasoning tokens — Claude Code can't handle them
@@ -687,6 +695,7 @@ VLLM_MLX_ENABLE_THINKING=false \
     --timeout 600 \
     --enable-auto-tool-choice \
     --tool-call-parser auto \
+    --tool-call-truncation-notice \
     > "$LOG_FILE" 2>&1 &
 SERVER_PID=$!
 # cleanup()/trap are armed earlier (before memory_preflight) so a sudo'd GPU

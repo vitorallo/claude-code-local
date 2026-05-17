@@ -333,18 +333,39 @@ The installed engine is confirmed to be the
 `_clean_gemma4_channels` patch), so this is the fork's behaviour, not a wrong
 dependency.
 
+**Fixed in the fork** (`vitorallo/vllm-mlx`, branch
+`fix/gemma4-toolcall-safe-and-faildloud`, commit `766801d`):
+- **D1 & D2 — `_clean_gemma4_channels` is now tool-call-span-safe.** Channel
+  stripping is applied only *outside* `<|tool_call>…<tool_call|>` spans
+  (spans kept verbatim, reusing the engine's own `_TOOL_CALL_TAGS`). A tool
+  call after a truncated/unclosed thought is no longer deleted, and a
+  channel marker *inside* a file body no longer corrupts the call. With no
+  tool-call markers present, behaviour is byte-for-byte identical to before
+  (Gemma-only, foil-safe). Covered by `tests/test_gemma4_toolcall_safety.py`.
+- **Fail-loud `--tool-call-truncation-notice` (opt-in, default OFF).** When a
+  tool call is still truncated by the token cap (JSON never closes), the
+  server returns an explicit *"write the file in smaller parts"* message
+  instead of silent HTTP-200 text. Model-agnostic; default-off and
+  condition-specific so foil / non-tool / non-truncated paths are unchanged.
+  `run.sh` enables it on the `vllm-mlx serve` line.
+
 **Mitigations (in `run.sh`)**:
+- **Proactive guidance**: `run.sh` passes `--append-system-prompt` telling
+  the model up front to write files >~150 lines in sections, so it pre-empts
+  truncation rather than hitting it.
 - `CC_OUTPUT_TOKENS` default raised **4096 → 8192** for *all* models, with
   per-run override `--out-tokens N` (use `16384` for big files; pair with
   `--safe` if a large model then OOMs).
 - `server.log` is now **rotated** to `server.log.1` instead of truncated, so
   a failed tool-call session can actually be inspected afterward.
 
-**Not yet fixed (fork-side)**: factors 2 and 3 need a patch to
-`_clean_gemma4_channels` (don't strip channel markers that fall *inside* a
-tool-call span / a JSON string). Raising `--out-tokens` reduces factor 1 but
-does not address content-collision. For heavy file-writing, `gemma-light` or
-a coder model is currently more reliable.
+**Honest limits**: this combination removes the *silent* failure and the
+*destroyed-call* bugs, but a single artifact larger than the output-token
+budget still can't be emitted in one call on a black-box local engine — the
+proactive + fail-loud guidance steers the agent to chunk it. For heavy
+file-writing, `gemma-light` or a coder model remains faster/more reliable.
+The fix lands in users' venvs once the branch is merged to
+`claude-code-local-patches` (or `install.sh` is repointed at the branch).
 
 ---
 
