@@ -673,6 +673,12 @@ CLAUDE_FLAGS=(
     --strict-mcp-config
     --mcp-config "$MCP_CONFIG"
     --tools "Bash,Read,Edit,Write,Glob,Grep,WebSearch,WebFetch"
+    # Pre-allow the same 8 built-in tools so auto mode never makes its
+    # model-based safety-classifier call (a slow, serialized local model
+    # can't service it in time -> "model temporarily unavailable", Write
+    # blocked). Tool set stays scoped to these 8 via --tools above; nothing
+    # outside the list is auto-approved.
+    --allowedTools "Bash,Read,Edit,Write,Glob,Grep,WebSearch,WebFetch"
     --append-system-prompt "$_WRITE_IN_PARTS_GUIDANCE"
 )
 
