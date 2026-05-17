@@ -353,6 +353,86 @@ manage_cached_models() {
     done
 }
 
+# =============================================================================
+# Memory preflight
+# =============================================================================
+# Server-side context window (vllm-mlx --max-tokens). Lowered automatically /
+# interactively when the chosen model leaves little RAM headroom — the KV cache
+# for a large context is what OOM-crashes Metal on tight machines.
+VLLM_MAX_TOKENS=32768
+
+_raise_wired_limit() {
+    local target=$1
+    printf "  Raising Metal GPU wired limit to ${target}MB ${DIM}(sudo — may prompt)${RESET}...\n"
+    if sudo sysctl iogpu.wired_limit_mb="$target" >/dev/null 2>&1; then
+        printf "  ${GREEN}Set.${RESET} ${DIM}Resets to default on reboot.${RESET}\n"
+    else
+        printf "  ${RED}Could not set it${RESET} — continuing without the bump.\n"
+    fi
+}
+
+# Estimate model footprint vs unified RAM. If headroom is tight, offer two
+# safeguards: shrink the server context, and/or raise the Metal GPU memory
+# limit. Skips silently when CCLOCAL_NO_MEMCHECK=1 or the model size is unknown.
+memory_preflight() {
+    [[ "${CCLOCAL_NO_MEMCHECK:-0}" == "1" ]] && return 0
+
+    local total_mb model_mb free_mb wired_mb rec_mb cache_dir i
+    total_mb=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1048576 ))
+    [[ "$total_mb" -le 0 ]] && return 0   # can't determine RAM — don't block
+
+    # Real on-disk size if cached, else catalog estimate (e.g. "16GB").
+    cache_dir="$HF_CACHE/models--${MODEL//\//--}"
+    if [[ -d "$cache_dir" ]]; then
+        model_mb=$(( $(du -sk "$cache_dir" 2>/dev/null | cut -f1 || echo 0) / 1024 ))
+    else
+        for i in "${!MODEL_IDS[@]}"; do
+            if [[ "${MODEL_IDS[$i]}" == "$MODEL" ]]; then
+                model_mb=$(( ${MODEL_SIZES[$i]%%GB*} * 1024 ))
+                break
+            fi
+        done
+    fi
+    [[ -z "${model_mb:-}" || "${model_mb:-0}" -le 0 ]] && return 0   # unknown — skip
+
+    free_mb=$(( total_mb - model_mb ))
+    wired_mb=$(sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo 0)
+    rec_mb=$(( total_mb - 3072 ))   # leave ~3GB for the OS
+
+    # >=9GB left for KV cache + activations + OS is comfortable for agentic use.
+    [[ "$free_mb" -ge 9216 ]] && return 0
+
+    printf "\n  ${YELLOW}⚠ Tight memory${RESET}  ~$(( model_mb / 1024 ))GB model on $(( total_mb / 1024 ))GB RAM "
+    printf "(~$(( free_mb / 1024 ))GB left for KV cache).\n"
+    printf "  ${DIM}Large agentic contexts have OOM-crashed vllm-mlx in this range.${RESET}\n\n"
+    printf "  ${BOLD}Safeguards:${RESET}\n"
+    printf "    ${CYAN}1${RESET}) Shrink context   --max-tokens ${VLLM_MAX_TOKENS} → 16384   ${DIM}(recommended)${RESET}\n"
+    if [[ "${wired_mb:-0}" -lt "$rec_mb" ]]; then
+        printf "    ${CYAN}2${RESET}) Raise GPU limit  iogpu.wired_limit_mb ${wired_mb:-0} → ${rec_mb}  ${DIM}(sudo, until reboot)${RESET}\n"
+    else
+        printf "    ${DIM}2) GPU limit already ${wired_mb}MB — fine${RESET}\n"
+    fi
+    printf "    ${CYAN}3${RESET}) Both\n"
+    printf "    ${CYAN}c${RESET}) Continue as-is ${DIM}(risky)${RESET}     ${CYAN}q${RESET}) Quit\n\n"
+
+    if ! [[ -t 0 ]]; then
+        printf "  ${DIM}Non-interactive — applying recommended (shrink context).${RESET}\n"
+        VLLM_MAX_TOKENS=16384
+        return 0
+    fi
+
+    local choice
+    read -rp "  Choose [1/2/3/c/q] (Enter = 1): " choice
+    case "$choice" in
+        ""|1)  VLLM_MAX_TOKENS=16384 ;;
+        2)     _raise_wired_limit "$rec_mb" ;;
+        3)     VLLM_MAX_TOKENS=16384; _raise_wired_limit "$rec_mb" ;;
+        c|C)   printf "  ${DIM}Continuing with current settings.${RESET}\n" ;;
+        q|Q)   printf "  Aborted.\n"; exit 0 ;;
+        *)     printf "  ${DIM}Unrecognized — applying recommended.${RESET}\n"; VLLM_MAX_TOKENS=16384 ;;
+    esac
+}
+
 show_help() {
     cat <<EOF
 ${BOLD}Usage:${RESET} cclocal [OPTIONS]
@@ -378,6 +458,7 @@ ${BOLD}Commands${RESET}
 ${BOLD}Server options${RESET}
   --server        Start vllm-mlx server only (don't launch Claude Code)
   --port N        Server port (default: 8000)
+  --no-mem-check  Skip the RAM-headroom preflight prompt
 
 ${BOLD}Other${RESET}
   -h, --help      Show this help
@@ -425,6 +506,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --port)    PORT="$2"; shift 2 ;;
         --server)  SERVER_ONLY=true; shift ;;
+        --no-mem-check) CCLOCAL_NO_MEMCHECK=1; shift ;;
         --list|-l)
             print_header
             list_cached_all
@@ -477,6 +559,8 @@ if ! is_cached "$MODEL"; then
     printf "  ${YELLOW}Note:${RESET}   model not cached — first run will download\n"
 fi
 echo ""
+
+memory_preflight
 
 # Kill any existing process on the port
 existing_pid=$(lsof -ti:"$PORT" 2>/dev/null || true)
@@ -537,7 +621,7 @@ CLAUDE_FLAGS=(
 VLLM_MLX_ENABLE_THINKING=false \
 "$VLLM_BIN" serve "$MODEL" \
     --port "$PORT" \
-    --max-tokens 32768 \
+    --max-tokens "$VLLM_MAX_TOKENS" \
     --kv-cache-quantization \
     --cache-memory-percent 0.35 \
     --prefill-step-size 4096 \
@@ -558,24 +642,67 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Wait for server to be ready
-printf "${DIM}Waiting for server...${RESET}"
-for i in $(seq 1 180); do
+# Wait for server to be ready.
+# First run downloads the model from HuggingFace into $HF_CACHE, which can take
+# many minutes for large models. Instead of a blind fixed timeout, watch the
+# model's cache dir grow and show live download size + speed. We only give up
+# if there's genuinely no progress — a slow-but-progressing download won't fail.
+MODEL_CACHE_DIR="$HF_CACHE/models--${MODEL//\//--}"
+STALL_LIMIT=240   # seconds with neither download progress nor a ready server
+POLL=3
+
+fmt_kb() {
+    local kb=$1
+    if   [[ $kb -ge 1048576 ]]; then printf '%d.%dGB' $((kb / 1048576)) $(((kb % 1048576) * 10 / 1048576))
+    elif [[ $kb -ge 1024 ]];    then printf '%dMB' $((kb / 1024))
+    else printf '%dKB' "$kb"; fi
+}
+
+printf "${DIM}Waiting for server...${RESET}\n"
+start_ts=$(date +%s)
+last_ts=$start_ts
+last_kb=0
+stall_secs=0
+
+while true; do
     if curl -s "http://127.0.0.1:$PORT/health" 2>/dev/null | grep -q "healthy"; then
-        printf " ${GREEN}ready${RESET} ${DIM}(${i}s)${RESET}\n"
+        printf "\r\033[K${GREEN}Server ready${RESET} ${DIM}($(( $(date +%s) - start_ts ))s)${RESET}\n"
         break
     fi
     if ! kill -0 $SERVER_PID 2>/dev/null; then
-        printf " ${RED}failed${RESET}\n"
-        echo "Server process died. Check: tail $LOG_FILE"
+        printf "\r\033[K${RED}Server process died${RESET}. Check: ${DIM}tail $LOG_FILE${RESET}\n"
         exit 1
     fi
-    if [[ $i -eq 180 ]]; then
-        printf " ${RED}timeout${RESET}\n"
-        echo "Server did not become ready in 180s."
-        exit 1
+
+    now_ts=$(date +%s)
+    cur_kb=0
+    [[ -d "$MODEL_CACHE_DIR" ]] && cur_kb=$(du -sk "$MODEL_CACHE_DIR" 2>/dev/null | cut -f1)
+    cur_kb=${cur_kb:-0}
+
+    if [[ "$cur_kb" -gt "$last_kb" ]]; then
+        # Actively downloading — show size + speed, reset the stall timer
+        dt=$(( now_ts - last_ts )); [[ $dt -lt 1 ]] && dt=1
+        rate_kb=$(( (cur_kb - last_kb) / dt ))
+        printf "\r\033[K${CYAN}⬇ Downloading model${RESET} ${BOLD}%s${RESET} ${DIM}(%d.%d MB/s)${RESET}" \
+            "$(fmt_kb "$cur_kb")" "$(( rate_kb / 1024 ))" "$(( (rate_kb % 1024) * 10 / 1024 ))"
+        stall_secs=0
+        last_kb=$cur_kb
+        last_ts=$now_ts
+    else
+        stall_secs=$(( stall_secs + POLL ))
+        if [[ "$cur_kb" -gt 0 ]]; then
+            printf "\r\033[K${DIM}⏳ Model cached (%s) — loading into memory... %ss${RESET}" \
+                "$(fmt_kb "$cur_kb")" "$stall_secs"
+        else
+            printf "\r\033[K${DIM}⏳ Starting server... %ss${RESET}" "$stall_secs"
+        fi
+        if [[ "$stall_secs" -ge "$STALL_LIMIT" ]]; then
+            printf "\r\033[K${RED}timeout${RESET} — no download activity and not ready after ${STALL_LIMIT}s\n"
+            echo "Check: tail -f $LOG_FILE"
+            exit 1
+        fi
     fi
-    sleep 1
+    sleep "$POLL"
 done
 
 if [[ "$SERVER_ONLY" == true ]]; then

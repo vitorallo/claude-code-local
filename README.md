@@ -213,6 +213,77 @@ In `vllm_mlx/utils/tokenizer.py`, the function `load_model_with_fallback()` was 
 
 **Solution**: `run.sh` passes the full model ID (e.g., `mlx-community/gemma-4-e4b-it-4bit`).
 
+### 16. First-run model download looks like a hang
+
+**Problem**: On first use of a model, `vllm-mlx serve` downloads it from HuggingFace
+(5–18GB) before the server comes up. The readiness check previously did a blind
+fixed-duration poll of `/health` with no output, so a multi-GB download that
+took longer than the timeout looked like a frozen/failed launch — even though
+it was downloading fine.
+
+**Solution**: `run.sh` now watches the model's HuggingFace cache directory and
+prints a live progress line while it grows:
+
+```
+⬇ Downloading model 8.4GB (42.3 MB/s)
+⏳ Model cached (16.0GB) — loading into memory... 12s
+```
+
+The timeout is no longer a blind wall: it only aborts if there is **no**
+download progress *and* the server is not ready for a sustained period
+(`STALL_LIMIT`, 240s). A slow-but-progressing download never false-times-out,
+and a partial download is preserved in `~/.cache/huggingface/hub` so a restart
+resumes rather than starting over. Progress is measured by cache-directory
+size (robust) rather than scraping HuggingFace's tqdm bars from the log.
+
+### 17. OOM crash under agentic load — memory preflight
+
+**Problem**: On a 24GB machine, large models (Gemma-4-26B ~16GB, Coder ~18GB)
+survive short prompts but the KV cache grows every turn as Claude Code feeds
+back tool output. Once context passes ~24K tokens the KV cache + model weights
+exceed the Metal memory budget and MLX throws an uncaught C++ exception:
+
+```
+libc++abi: terminating due to uncaught exception of type std::runtime_error:
+[METAL] Command buffer execution failed: Insufficient Memory
+(kIOGPUCommandBufferCallbackErrorOutOfMemory)
+```
+
+This kills the **entire** vllm-mlx process (not a recoverable per-request
+error), and the in-progress Claude Code session is left retrying a dead
+backend with `ConnectionRefused`.
+
+**Solution**: `run.sh` runs a `memory_preflight` before starting the server.
+It estimates the model footprint (real on-disk size if cached, else the
+catalog estimate) against total RAM. If less than ~9GB would be left for the
+KV cache it shows an interactive safeguard menu:
+
+```
+⚠ Tight memory  ~16GB model on 24GB RAM (~8GB left for KV cache).
+Safeguards:
+  1) Shrink context   --max-tokens 32768 → 16384   (recommended)
+  2) Raise GPU limit  iogpu.wired_limit_mb 0 → 21504  (sudo, until reboot)
+  3) Both
+  c) Continue as-is (risky)     q) Quit
+Choose [1/2/3/c/q] (Enter = 1):
+```
+
+- **Option 1** lowers the server-side context window (`--max-tokens`), which
+  is the single biggest KV-cache saver.
+- **Option 2** raises the Metal GPU wired-memory limit via
+  `sudo sysctl iogpu.wired_limit_mb=<RAM−3GB>`. This is intentionally **not**
+  persisted across reboots — it resets to the macOS default on restart, which
+  is the desired behaviour (a temporary, per-session bump).
+- If the GPU limit is already at/above the recommended value, option 2 is
+  shown as "already fine" instead of being offered.
+
+5GB models on 24GB have ~19GB of headroom and never trigger the prompt — they
+launch straight through. The check is skipped entirely with `--no-mem-check`
+(or `CCLOCAL_NO_MEMCHECK=1`), auto-applies the recommended shrink in
+non-interactive runs, and skips silently if the model size can't be estimated.
+Recovery from a crash: exit the dead Claude session, then relaunch with a
+smaller model (`cclocal --gemma-light`).
+
 ---
 
 ## Troubleshooting
@@ -221,7 +292,8 @@ In `vllm_mlx/utils/tokenizer.py`, the function `load_model_with_fallback()` was 
 |---------|-------|-----|
 | vllm-mlx crashes on startup (TypeError: NoneType) | Using unpatched upstream | `./install.sh` installs from our fork which has the fix |
 | Model generates text about tools but nothing executes | Using Ollama | Switch to vllm-mlx — Ollama can't produce real tool_use blocks |
-| Metal GPU OOM | Model too large for concurrent requests | Use default model (9B) or accept single-request mode |
+| Metal GPU OOM crash under load (`kIOGPUCommandBufferCallbackErrorOutOfMemory`) | Large model + growing agentic context exceeds RAM | Take the `memory_preflight` prompt (shrink context / raise GPU limit), or use a 5GB model — see #17 |
+| First run hangs at "Waiting for server..." | Multi-GB model still downloading from HuggingFace | It's not hung — a live download progress line now shows; partial downloads resume — see #16 |
 | Claude Code asks about "detected custom API key" | Real API key leaking | Use `cclocal` which unsets real keys |
 | "Model does not exist" (404) | Wrong model name | Must use full HuggingFace ID, not "default" |
 | Slow responses (30-60s) | Normal for local inference | Context grows each turn — 24K+ tokens at ~8 tok/s |
@@ -257,6 +329,14 @@ In `vllm_mlx/utils/tokenizer.py`, the function `load_model_with_fallback()` was 
 | `--prefill-step-size 4096` | Faster time-to-first-token on large prompts |
 | `--stream-interval 4` | Batch 4 tokens before streaming for throughput |
 | `--timeout 600` | 10 min timeout (default 300s caused disconnects) |
+| `--max-tokens` | Server context window: `32768`, or `16384` if the memory preflight shrinks it (see #17) |
+
+### CLI flags / env (memory preflight)
+
+| Flag / env | Purpose |
+|------------|---------|
+| `--no-mem-check` / `CCLOCAL_NO_MEMCHECK=1` | Skip the RAM-headroom preflight prompt (see #17) |
+| `iogpu.wired_limit_mb` | Optionally raised via `sudo sysctl` by preflight option 2; **per-session only**, resets on reboot |
 
 ### Claude Code flags (set by run.sh)
 
