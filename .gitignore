@@ -1,4 +1,4 @@
-server.log
+server.log*
 .DS_Store
 .venv/
 foil-migration.md
