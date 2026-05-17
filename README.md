@@ -334,7 +334,13 @@ The installed engine is confirmed to be the
 dependency.
 
 **Fixed in the fork** (`vitorallo/vllm-mlx`, branch
-`fix/gemma4-toolcall-safe-and-faildloud`, commit `766801d`):
+`fix/gemma4-toolcall-safe-and-faildloud`):
+- **Pinned MLX stack.** `pyproject.toml` now pins `mlx==0.31.1` /
+  `mlx-lm==0.31.1` and caps `mlx-vlm<0.5.0`. `mlx 0.31.2` breaks GPU
+  streams in worker threads (`RuntimeError: There is no Stream(gpu, 1)`)
+  and `mlx-vlm 0.5.0` hard-requires the broken `mlx>=0.31.2`; the prior
+  `>=` floors let a reinstall pull the broken stack. Mirrors foil's
+  `vendor/vllm-mlx` pins. Revisit if upstream mlx-lm fixes the thread bug.
 - **D1 & D2 — `_clean_gemma4_channels` is now tool-call-span-safe.** Channel
   stripping is applied only *outside* `<|tool_call>…<tool_call|>` spans
   (spans kept verbatim, reusing the engine's own `_TOOL_CALL_TAGS`). A tool
