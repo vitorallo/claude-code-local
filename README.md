@@ -103,6 +103,8 @@ claude --strict-mcp-config --mcp-config /path/to/claude-code-local/mcp-local.jso
 
 Running Claude Code with a local model isn't just "point it at localhost". There are 15 problems that break the experience. This section documents every one and how `run.sh` handles it.
 
+> 📄 For a consolidated field report — every problem tackled, root causes, the fixes/improvements, the honest model-capability limits, and how it scales to larger hardware — see [`docs/running-claude-code-on-local-llms.md`](docs/running-claude-code-on-local-llms.md).
+
 ### 1. Ollama can't produce real tool calls
 
 **Problem**: Ollama's Anthropic API adapter generates text that *looks like* tool calls but never emits real `tool_use` content blocks. Claude Code receives plain text, never executes anything. Tested with qwen3.5:9b, qwen3.5:35b-a3b, glm-4.7-flash — all produce fake tool calls.
