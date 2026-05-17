@@ -339,20 +339,21 @@ dependency.
   `mlx-lm==0.31.1` and caps `mlx-vlm<0.5.0`. `mlx 0.31.2` breaks GPU
   streams in worker threads (`RuntimeError: There is no Stream(gpu, 1)`)
   and `mlx-vlm 0.5.0` hard-requires the broken `mlx>=0.31.2`; the prior
-  `>=` floors let a reinstall pull the broken stack. Mirrors foil's
-  `vendor/vllm-mlx` pins. Revisit if upstream mlx-lm fixes the thread bug.
+  `>=` floors let a reinstall pull the broken stack. Revisit if upstream
+  mlx-lm fixes the thread bug.
 - **D1 & D2 — `_clean_gemma4_channels` is now tool-call-span-safe.** Channel
   stripping is applied only *outside* `<|tool_call>…<tool_call|>` spans
   (spans kept verbatim, reusing the engine's own `_TOOL_CALL_TAGS`). A tool
   call after a truncated/unclosed thought is no longer deleted, and a
   channel marker *inside* a file body no longer corrupts the call. With no
   tool-call markers present, behaviour is byte-for-byte identical to before
-  (Gemma-only, foil-safe). Covered by `tests/test_gemma4_toolcall_safety.py`.
+  (Gemma-only, no impact on other consumers). Covered by
+  `tests/test_gemma4_toolcall_safety.py`.
 - **Fail-loud `--tool-call-truncation-notice` (opt-in, default OFF).** When a
   tool call is still truncated by the token cap (JSON never closes), the
   server returns an explicit *"write the file in smaller parts"* message
   instead of silent HTTP-200 text. Model-agnostic; default-off and
-  condition-specific so foil / non-tool / non-truncated paths are unchanged.
+  condition-specific so non-tool / non-truncated paths are unchanged.
   `run.sh` enables it on the `vllm-mlx serve` line.
 
 **Mitigations (in `run.sh`)**:

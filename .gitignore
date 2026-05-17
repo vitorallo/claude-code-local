@@ -1,4 +1,5 @@
 server.log*
+INVESTIGATION-mlx-stream-gpu.md
 .DS_Store
 .venv/
 foil-migration.md

@@ -38,7 +38,7 @@ echo "  uv: $(uv --version)"
 # - Tool-call-span-safe channel cleaning (D1/D2) + opt-in
 #   --tool-call-truncation-notice (see README #18)
 # claude-code-local-patches itself is intentionally left untouched so other
-# consumers (e.g. foil) are unaffected until/if this branch is merged there.
+# downstream consumers are unaffected until/if this branch is merged there.
 #
 # To manually roll back to the base branch, swap the line below for:
 # VLLM_MLX_REPO="git+https://github.com/vitorallo/vllm-mlx.git@claude-code-local-patches"
