@@ -254,12 +254,16 @@ error), and the in-progress Claude Code session is left retrying a dead
 backend with `ConnectionRefused`.
 
 **Solution**: `run.sh` runs a `memory_preflight` before starting the server.
-It estimates the model footprint (real on-disk size if cached, else the
-catalog estimate) against total RAM. If less than ~9GB would be left for the
-KV cache it shows an interactive safeguard menu:
+
+The binding constraint is **not** total RAM — macOS only makes ~75% of RAM
+GPU-addressable by default (the `iogpu.wired_limit_mb` cap). So the preflight
+estimates the model footprint (real on-disk size if cached, else the catalog
+estimate) against the **effective GPU budget**: the wired limit if explicitly
+set, otherwise ~75% of RAM. If less than ~6GB of GPU headroom would be left
+after the weights, it shows an interactive safeguard menu:
 
 ```
-⚠ Tight memory  ~16GB model on 24GB RAM (~8GB left for KV cache).
+⚠ Tight memory  ~15GB model, GPU budget ~18GB → ~3GB for KV cache.
 Safeguards:
   1) Shrink context   --max-tokens 32768 → 16384   (recommended)
   2) Raise GPU limit  iogpu.wired_limit_mb 0 → 21504  (sudo, until reboot)
@@ -268,24 +272,29 @@ Safeguards:
 Choose [1/2/3/c/q] (Enter = 1):
 ```
 
+(This GPU-budget metric is why a ~15GB cached model with ~9GB of *free RAM*
+still OOM-crashed — only ~3GB was actually GPU-usable under the default cap.)
+
 - **Option 1** lowers the server-side context window (`--max-tokens`), which
   is the single biggest KV-cache saver.
 - **Option 2** raises the Metal GPU wired-memory limit via
   `sudo sysctl iogpu.wired_limit_mb=<RAM−3GB>`. It is strictly a temporary,
-  per-session bump: the original value is captured and **automatically
-  reverted on exit** (best-effort via `sudo -n`; if the sudo credentials have
-  expired by shutdown it prints the one-line command to restore manually).
-  It is also intentionally **not** persisted across reboots — macOS resets it
-  to the default on restart regardless.
+  per-session bump: the original value is captured and **reverted on exit**.
+  The revert uses a normal `sudo` (it will **prompt for your password** at
+  shutdown if the cached credentials have expired); if you skip the prompt it
+  prints the one-line command to restore manually. It is also **not**
+  persisted across reboots — macOS resets it to the default on restart.
 - If the GPU limit is already at/above the recommended value, option 2 is
   shown as "already fine" instead of being offered.
 
-5GB models on 24GB have ~19GB of headroom and never trigger the prompt — they
-launch straight through. The check is skipped entirely with `--no-mem-check`
-(or `CCLOCAL_NO_MEMCHECK=1`), auto-applies the recommended shrink in
-non-interactive runs, and skips silently if the model size can't be estimated.
-Recovery from a crash: exit the dead Claude session, then relaunch with a
-smaller model (`cclocal --gemma-light`).
+Models that fit comfortably (e.g. 5GB models with ~13GB+ of GPU headroom)
+never trigger the prompt — they launch straight through. To **force** the
+menu for any model regardless of the heuristic, use `--safe` (or
+`CCLOCAL_FORCE_MEMCHECK=1`). The check is skipped entirely with
+`--no-mem-check` (or `CCLOCAL_NO_MEMCHECK=1`), auto-applies the recommended
+shrink in non-interactive runs, and skips silently if the model size can't be
+estimated. Recovery from a crash: exit the dead Claude session, then relaunch
+with a smaller model (`cclocal --gemma-light`) or with `--safe`.
 
 ---
 
@@ -338,8 +347,9 @@ smaller model (`cclocal --gemma-light`).
 
 | Flag / env | Purpose |
 |------------|---------|
-| `--no-mem-check` / `CCLOCAL_NO_MEMCHECK=1` | Skip the RAM-headroom preflight prompt (see #17) |
-| `iogpu.wired_limit_mb` | Optionally raised via `sudo sysctl` by preflight option 2; **per-session only** — auto-reverted on exit, and resets on reboot |
+| `--safe` / `CCLOCAL_FORCE_MEMCHECK=1` | Always show the memory-safeguard menu, for any model (see #17) |
+| `--no-mem-check` / `CCLOCAL_NO_MEMCHECK=1` | Skip the GPU-headroom preflight prompt (see #17) |
+| `iogpu.wired_limit_mb` | Optionally raised via `sudo sysctl` by preflight option 2; **per-session only** — reverted on exit (prompts for sudo at shutdown if creds expired), and resets on reboot |
 
 ### Claude Code flags (set by run.sh)
 

@@ -376,13 +376,17 @@ _raise_wired_limit() {
     fi
 }
 
-# Estimate model footprint vs unified RAM. If headroom is tight, offer two
-# safeguards: shrink the server context, and/or raise the Metal GPU memory
-# limit. Skips silently when CCLOCAL_NO_MEMCHECK=1 or the model size is unknown.
+# Estimate model footprint vs the Metal GPU memory budget — the real OOM
+# constraint. macOS only makes ~75% of RAM GPU-addressable by default (the
+# iogpu.wired_limit_mb cap), so "free RAM" overstates what's actually usable.
+# If GPU headroom is tight — or --safe / CCLOCAL_FORCE_MEMCHECK forces it —
+# offer two safeguards: shrink the server context and/or raise the GPU limit.
+# Skips silently when CCLOCAL_NO_MEMCHECK=1 or the model size is unknown.
 memory_preflight() {
     [[ "${CCLOCAL_NO_MEMCHECK:-0}" == "1" ]] && return 0
 
-    local total_mb model_mb free_mb wired_mb rec_mb cache_dir i
+    local total_mb model_mb wired_mb gpu_mb gpu_free_mb rec_mb cache_dir i forced
+    forced="${CCLOCAL_FORCE_MEMCHECK:-0}"
     total_mb=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1048576 ))
     [[ "$total_mb" -le 0 ]] && return 0   # can't determine RAM — don't block
 
@@ -400,15 +404,25 @@ memory_preflight() {
     fi
     [[ -z "${model_mb:-}" || "${model_mb:-0}" -le 0 ]] && return 0   # unknown — skip
 
-    free_mb=$(( total_mb - model_mb ))
     wired_mb=$(sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo 0)
+    # Effective GPU budget: the wired limit if explicitly set, else the macOS
+    # default of ~75% of RAM.
+    if [[ "${wired_mb:-0}" -gt 0 ]]; then
+        gpu_mb=$wired_mb
+    else
+        gpu_mb=$(( total_mb * 3 / 4 ))
+    fi
+    gpu_free_mb=$(( gpu_mb - model_mb ))
     rec_mb=$(( total_mb - 3072 ))   # leave ~3GB for the OS
 
-    # >=9GB left for KV cache + activations + OS is comfortable for agentic use.
-    [[ "$free_mb" -ge 9216 ]] && return 0
+    # >=6GB GPU headroom after weights comfortably holds a ~25-32K-token
+    # agentic KV cache (8-bit quantized). Below that it OOM-crashes.
+    if [[ "$forced" != "1" && "$gpu_free_mb" -ge 6144 ]]; then
+        return 0
+    fi
 
-    printf "\n  ${YELLOW}⚠ Tight memory${RESET}  ~$(( model_mb / 1024 ))GB model on $(( total_mb / 1024 ))GB RAM "
-    printf "(~$(( free_mb / 1024 ))GB left for KV cache).\n"
+    printf "\n  ${YELLOW}⚠ Tight memory${RESET}  ~$(( model_mb / 1024 ))GB model, "
+    printf "GPU budget ~$(( gpu_mb / 1024 ))GB → ~$(( gpu_free_mb / 1024 ))GB for KV cache.\n"
     printf "  ${DIM}Large agentic contexts have OOM-crashed vllm-mlx in this range.${RESET}\n\n"
     printf "  ${BOLD}Safeguards:${RESET}\n"
     printf "    ${CYAN}1${RESET}) Shrink context   --max-tokens ${VLLM_MAX_TOKENS} → 16384   ${DIM}(recommended)${RESET}\n"
@@ -464,6 +478,7 @@ ${BOLD}Server options${RESET}
   --server        Start vllm-mlx server only (don't launch Claude Code)
   --port N        Server port (default: 8000)
   --no-mem-check  Skip the RAM-headroom preflight prompt
+  --safe          Always show the memory-safeguard menu (force, any model)
 
 ${BOLD}Other${RESET}
   -h, --help      Show this help
@@ -512,6 +527,7 @@ while [[ $# -gt 0 ]]; do
         --port)    PORT="$2"; shift 2 ;;
         --server)  SERVER_ONLY=true; shift ;;
         --no-mem-check) CCLOCAL_NO_MEMCHECK=1; shift ;;
+        --safe)         CCLOCAL_FORCE_MEMCHECK=1; shift ;;
         --list|-l)
             print_header
             list_cached_all
@@ -570,11 +586,14 @@ echo ""
 # launch aborts before the server starts.
 cleanup() {
     if [[ -n "${WIRED_RESTORE:-}" ]]; then
-        printf "\n${DIM}Restoring Metal GPU wired limit to ${WIRED_RESTORE}...${RESET}\n"
-        if sudo -n sysctl iogpu.wired_limit_mb="$WIRED_RESTORE" >/dev/null 2>&1; then
+        printf "\n${BOLD}Restoring Metal GPU wired limit to ${WIRED_RESTORE}${RESET} — enter your password if prompted:\n"
+        # Plain sudo (not -n): if credentials expired this prompts for the
+        # password. stderr is left attached so the prompt is visible; only the
+        # sysctl stdout (the echoed new value) is suppressed.
+        if sudo sysctl iogpu.wired_limit_mb="$WIRED_RESTORE" >/dev/null; then
             printf "${DIM}Restored.${RESET}\n"
         else
-            printf "${YELLOW}Could not auto-restore${RESET} (sudo credentials expired). Run:\n"
+            printf "${YELLOW}Restore did not complete.${RESET} Run manually:\n"
             printf "  ${DIM}sudo sysctl iogpu.wired_limit_mb=${WIRED_RESTORE}${RESET}\n"
             printf "${DIM}(It also resets to the macOS default on reboot.)${RESET}\n"
         fi
