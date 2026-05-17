@@ -72,12 +72,48 @@ cclocal --list         # List cached models on disk
 cclocal --rm           # Manage/delete cached models (interactive)
 cclocal --server       # Start server only, connect Claude Code separately
 cclocal -h             # Show all options
+
+# Operational flags (combine with any model flag)
+cclocal --gemma --out-tokens 16384   # Bigger output budget for large file writes (default 8192)
+cclocal --gemma --safe               # Force the memory-safeguard menu (raise GPU limit / shrink ctx)
+cclocal --gemma --no-mem-check       # Skip the GPU-headroom preflight prompt
 ```
 
 Running `cclocal` with no arguments opens an interactive menu that shows every
 supported model, indicates which are already cached on disk, and lets you pick
 one or jump to a cache management screen. Use the model flags to skip the menu
 when you already know what you want.
+
+### What `cclocal` now handles for you (automatic)
+
+You don't configure these; `run.sh` applies them. Listed here so the behaviour
+isn't a surprise. Full root-cause writeups in [Why this is hard](#why-this-is-hard-and-how-we-solved-it)
+(#16–#18) and the [field report](docs/running-claude-code-on-local-llms.md).
+
+- **Memory preflight.** Before serving, it estimates the model footprint vs.
+  the *GPU budget* (the `iogpu.wired_limit_mb` cap, or ~75% of RAM — not total
+  RAM). If headroom is tight it offers to shrink the server context and/or
+  raise the GPU wired limit via `sudo` for the session (auto-reverted on exit,
+  never persisted across reboot). Silent when there's ample headroom; `--safe`
+  forces the menu, `--no-mem-check` skips it. See #17.
+- **Output budget.** `CLAUDE_CODE_MAX_OUTPUT_TOKENS` defaults to 8192 (raised
+  from a too-small value that silently truncated file writes); override with
+  `--out-tokens N`. See #18.
+- **No classifier stall.** The 8 built-in tools are pre-allowed
+  (`--allowedTools`), so auto mode never makes the slow per-action
+  safety-classifier model call that a serialized local model can't answer in
+  time. Tool set stays scoped; nothing outside it is auto-approved.
+- **Write-in-parts hint.** A system-prompt line tells the model to build
+  large files incrementally, pre-empting the truncation cycle.
+- **Fail-loud truncation notice.** The fork is run with
+  `--tool-call-truncation-notice`: a tool call still truncated by the cap
+  returns an explicit "write it in smaller parts" message instead of silent
+  text. See #18.
+- **Diagnosable logs.** `server.log` is rotated to `server.log.1` on each
+  launch instead of truncated, so a failed session can be inspected.
+- **Pinned ML runtime.** `install.sh` pulls a fork branch that pins
+  `mlx==0.31.1` / `mlx-lm==0.31.1` (newer versions crash generation from a
+  worker thread). See #18.
 
 ### Server-only mode
 
@@ -423,6 +459,8 @@ The fix lands in users' venvs once the branch is merged to
 | `--stream-interval 4` | Batch 4 tokens before streaming for throughput |
 | `--timeout 600` | 10 min timeout (default 300s caused disconnects) |
 | `--max-tokens` | Server context window: `32768`, or `16384` if the memory preflight shrinks it (see #17) |
+| `--enable-auto-tool-choice --tool-call-parser auto` | Parse model output into structured tool_use blocks (Gemma 4 / Qwen / Mistral / Llama / Nemotron) |
+| `--tool-call-truncation-notice` | Fork flag: on a tool call truncated by `--max-tokens`, return an explicit "write it in smaller parts" message instead of silent text (see #18) |
 
 ### CLI flags / env (memory preflight)
 
@@ -440,6 +478,8 @@ The fix lands in users' venvs once the branch is merged to
 | `--strict-mcp-config` | Ignore global plugins |
 | `--mcp-config mcp-local.json` | Empty config — no plugin tools |
 | `--tools "Bash,Read,..."` | 8 essential built-in tools only |
+| `--allowedTools "Bash,Read,..."` | Pre-approve the same 8 tools so auto mode skips the slow per-action safety-classifier call (see #18) |
+| `--append-system-prompt "..."` | Tells the model to build files >~150 lines in incremental Write/Edit calls, pre-empting output-token truncation (see #18) |
 
 ---
 
