@@ -5,6 +5,12 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 MCP_CONFIG="$SCRIPT_DIR/mcp-local.json"
 HF_CACHE="$HOME/.cache/huggingface/hub"
 
+# Remote backend presets — any box running vLLM with the native Anthropic
+# Messages API (recent vLLM ships /v1/messages with real tool_use blocks).
+# Edit these to match your own boxes (Tailscale addresses shown).
+DGX_ACTIVE="http://100.96.179.64:8000"   # Qwen3.6-35B-A3B (MoE, faster)
+DGX_IDLE="http://100.126.117.58:8000"    # Qwen3.6-27B (dense, steadier)
+
 # =============================================================================
 # Model catalog (single source of truth)
 # =============================================================================
@@ -482,6 +488,12 @@ ${BOLD}Server options${RESET}
   --out-tokens N  Max output tokens Claude Code requests (default 8192;
                   raise for large file writes, e.g. 16384)
 
+${BOLD}Remote backend${RESET} ${DIM}(skip the local server, connect to a remote vLLM box)${RESET}
+  --dgx-active    DGX Spark preset ${DIM}($DGX_ACTIVE)${RESET}
+  --dgx-idle      DGX Spark preset ${DIM}($DGX_IDLE)${RESET}
+  --remote URL    Any remote vLLM endpoint, e.g. http://host:8000
+  --remote-model ID  Override model (default: auto-detect from /v1/models)
+
 ${BOLD}Other${RESET}
   -h, --help      Show this help
 
@@ -492,6 +504,8 @@ ${BOLD}Examples${RESET}
   cclocal --list           ${DIM}# show cached models${RESET}
   cclocal --rm             ${DIM}# manage/delete cached models${RESET}
   cclocal --server         ${DIM}# server only, connect Claude Code later${RESET}
+  cclocal --dgx-active     ${DIM}# remote DGX Spark (MoE box)${RESET}
+  cclocal --remote http://host:8000  ${DIM}# any remote vLLM box${RESET}
 EOF
 }
 
@@ -502,6 +516,8 @@ MODEL=""
 MODEL_NAME_DISPLAY=""
 PORT=8000
 SERVER_ONLY=false
+REMOTE_URL=""      # set by --remote / --dgx-* ; empty = local vllm-mlx
+REMOTE_MODEL=""    # optional override; else auto-detected from /v1/models
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -528,6 +544,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --port)    PORT="$2"; shift 2 ;;
         --server)  SERVER_ONLY=true; shift ;;
+        --remote)        REMOTE_URL="$2"; shift 2 ;;
+        --remote-model)  REMOTE_MODEL="$2"; shift 2 ;;
+        --dgx-active)    REMOTE_URL="$DGX_ACTIVE"; shift ;;
+        --dgx-idle)      REMOTE_URL="$DGX_IDLE"; shift ;;
         --no-mem-check) CCLOCAL_NO_MEMCHECK=1; shift ;;
         --safe)         CCLOCAL_FORCE_MEMCHECK=1; shift ;;
         --out-tokens)   CC_OUTPUT_TOKENS_OVERRIDE="$2"; shift 2 ;;
@@ -553,18 +573,21 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# No model flag given — show interactive menu
-if [[ -z "$MODEL" ]]; then
+# No model flag given — show interactive menu (local only; remote auto-detects)
+if [[ -z "$REMOTE_URL" && -z "$MODEL" ]]; then
     interactive_menu
 fi
 
 # =============================================================================
 # Pre-flight checks
 # =============================================================================
-VLLM_BIN="$SCRIPT_DIR/.venv/bin/vllm-mlx"
-if [[ ! -x "$VLLM_BIN" ]]; then
-    echo "${RED}ERROR: vllm-mlx not found in .venv. Run ./install.sh first.${RESET}"
-    exit 1
+# vllm-mlx is only needed when we run the model locally.
+if [[ -z "$REMOTE_URL" ]]; then
+    VLLM_BIN="$SCRIPT_DIR/.venv/bin/vllm-mlx"
+    if [[ ! -x "$VLLM_BIN" ]]; then
+        echo "${RED}ERROR: vllm-mlx not found in .venv. Run ./install.sh first.${RESET}"
+        exit 1
+    fi
 fi
 if ! command -v claude &>/dev/null; then
     printf "${RED}ERROR: Claude Code CLI not found. Install it first:${RESET}\n"
@@ -573,14 +596,60 @@ if ! command -v claude &>/dev/null; then
 fi
 
 # =============================================================================
+# Remote backend setup (reachability + model auto-detect)
+# =============================================================================
+# BASE_URL is what Claude Code points ANTHROPIC_BASE_URL at — the local server
+# by default, or the remote box when --remote/--dgx-* is used.
+if [[ -n "$REMOTE_URL" ]]; then
+    REMOTE_URL="${REMOTE_URL%/}"   # strip trailing slash
+
+    # Reachability check (a few short retries)
+    printf "${DIM}Checking remote endpoint $REMOTE_URL ...${RESET}\n"
+    http_code=""
+    reachable=false
+    for _ in 1 2 3 4 5; do
+        http_code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' "$REMOTE_URL/health" 2>/dev/null || true)
+        if [[ "$http_code" == "200" ]]; then reachable=true; break; fi
+        sleep 1
+    done
+    if [[ "$reachable" != true ]]; then
+        printf "${RED}ERROR: Cannot reach $REMOTE_URL/health (last status: ${http_code:-none}).${RESET}\n"
+        echo "  - Is the remote box actually serving vLLM on that address/port?"
+        echo "  - If it's a Tailscale address (100.x), is Tailscale up?  (tailscale status)"
+        exit 1
+    fi
+
+    # Model: explicit override wins, else auto-detect from /v1/models
+    if [[ -n "$REMOTE_MODEL" ]]; then
+        MODEL="$REMOTE_MODEL"
+    else
+        MODEL=$(curl -s -m 8 "$REMOTE_URL/v1/models" 2>/dev/null \
+            | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+        if [[ -z "$MODEL" ]]; then
+            printf "${RED}ERROR: Could not auto-detect a model from $REMOTE_URL/v1/models.${RESET}\n"
+            echo "  Pass one explicitly with:  --remote-model <id>"
+            exit 1
+        fi
+    fi
+    MODEL_NAME_DISPLAY="$MODEL"
+    BASE_URL="$REMOTE_URL"
+else
+    BASE_URL="http://127.0.0.1:$PORT"
+fi
+
+# =============================================================================
 # Launch
 # =============================================================================
 print_header
 printf "  ${BOLD}Model:${RESET}  ${MODEL_NAME_DISPLAY:-$MODEL}\n"
 printf "  ${DIM}ID:     $MODEL${RESET}\n"
-printf "  ${BOLD}Port:${RESET}   $PORT\n"
-if ! is_cached "$MODEL"; then
-    printf "  ${YELLOW}Note:${RESET}   model not cached — first run will download\n"
+if [[ -n "$REMOTE_URL" ]]; then
+    printf "  ${BOLD}Remote:${RESET} $BASE_URL\n"
+else
+    printf "  ${BOLD}Port:${RESET}   $PORT\n"
+    if ! is_cached "$MODEL"; then
+        printf "  ${YELLOW}Note:${RESET}   model not cached — first run will download\n"
+    fi
 fi
 echo ""
 
@@ -612,6 +681,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# --- Local server lifecycle (skipped entirely in remote mode) ---
+if [[ -z "$REMOTE_URL" ]]; then
 memory_preflight
 
 # Kill any existing process on the port
@@ -629,6 +700,7 @@ fi
 LOG_FILE="$SCRIPT_DIR/server.log"
 [[ -f "$LOG_FILE" ]] && mv -f "$LOG_FILE" "$LOG_FILE.1" 2>/dev/null || true
 printf "${DIM}Starting vllm-mlx server (logs: $LOG_FILE, prev: $LOG_FILE.1)...${RESET}\n"
+fi
 
 # CLAUDE_CODE_MAX_OUTPUT_TOKENS — per-request output cap sent by Claude Code.
 # Distinct from vllm-mlx's `--max-tokens` flag below (the server-side context
@@ -647,7 +719,7 @@ CC_OUTPUT_TOKENS="${CC_OUTPUT_TOKENS_OVERRIDE:-8192}"
 # Environment variables passed to Claude Code. Kept as a single array so the
 # --server print-out and the in-process launch cannot drift apart.
 CLAUDE_ENV=(
-    "ANTHROPIC_BASE_URL=http://127.0.0.1:$PORT"
+    "ANTHROPIC_BASE_URL=$BASE_URL"
     "ANTHROPIC_API_KEY=not-needed"
     "ANTHROPIC_MODEL=$MODEL"
     "ANTHROPIC_DEFAULT_OPUS_MODEL=$MODEL"
@@ -690,6 +762,8 @@ CLAUDE_FLAGS=(
 # 600s timeout — default 300s was causing disconnects on long generations
 # Auto tool parser — parses Gemma 4, Qwen, Mistral, Llama, Nemotron formats
 #                    into structured tool_use blocks (required for Gemma 4)
+# --- Start local server + wait for it to be ready (skipped in remote mode) ---
+if [[ -z "$REMOTE_URL" ]]; then
 VLLM_MLX_ENABLE_THINKING=false \
 "$VLLM_BIN" serve "$MODEL" \
     --port "$PORT" \
@@ -769,10 +843,16 @@ while true; do
     fi
     sleep "$POLL"
 done
+fi
+# --- end local server lifecycle ---
 
 if [[ "$SERVER_ONLY" == true ]]; then
     echo ""
-    printf "${BOLD}Server running at http://127.0.0.1:$PORT${RESET}\n"
+    if [[ -n "$REMOTE_URL" ]]; then
+        printf "${BOLD}Remote server already running at $BASE_URL${RESET}\n"
+    else
+        printf "${BOLD}Server running at $BASE_URL${RESET}\n"
+    fi
     echo "Connect Claude Code from any terminal with:"
     echo ""
     echo "  env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN \\"
@@ -781,8 +861,12 @@ if [[ "$SERVER_ONLY" == true ]]; then
     done
     echo "    claude ${CLAUDE_FLAGS[*]}"
     echo ""
-    echo "Press Ctrl+C to stop."
-    wait $SERVER_PID
+    if [[ -n "$REMOTE_URL" ]]; then
+        echo "(Remote server is managed elsewhere — nothing to keep alive here.)"
+    else
+        echo "Press Ctrl+C to stop."
+        wait $SERVER_PID
+    fi
 else
     echo ""
     printf "${DIM}Launching Claude Code...${RESET}\n\n"

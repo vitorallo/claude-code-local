@@ -77,6 +77,11 @@ cclocal -h             # Show all options
 cclocal --gemma --out-tokens 16384   # Bigger output budget for large file writes (default 8192)
 cclocal --gemma --safe               # Force the memory-safeguard menu (raise GPU limit / shrink ctx)
 cclocal --gemma --no-mem-check       # Skip the GPU-headroom preflight prompt
+
+# Remote backend — run the model on another box, not this Mac
+cclocal --dgx-active                 # DGX Spark preset (MoE, faster)
+cclocal --dgx-idle                   # DGX Spark preset (dense, steadier)
+cclocal --remote http://host:8000    # Any remote vLLM endpoint (model auto-detected)
 ```
 
 Running `cclocal` with no arguments opens an interactive menu that shows every
@@ -132,6 +137,44 @@ claude --strict-mcp-config --mcp-config /path/to/claude-code-local/mcp-local.jso
 ```
 
 > Replace `/path/to/claude-code-local` with wherever you cloned the repo. Or just use `cclocal --server` which prints the full command for you.
+
+### Remote backend (DGX Spark or any vLLM box)
+
+vllm-mlx is the answer for running **locally on Apple Silicon** — but the model
+doesn't have to live on this Mac. You can point Claude Code at a **remote** box
+running plain **vLLM** (e.g. an NVIDIA DGX Spark on your Tailnet). Recent vLLM
+ships a complete native **Anthropic Messages API** — `/v1/messages` with real
+`tool_use` blocks, Anthropic SSE streaming, and `count_tokens` — so the exact
+same wiring works. `run.sh` just skips the whole local-server lifecycle (no
+menu, no `.venv` check, no memory preflight, no download/serve) and points
+`ANTHROPIC_BASE_URL` at the remote.
+
+```bash
+cclocal --dgx-active                      # preset: MoE box (faster)
+cclocal --dgx-idle                        # preset: dense box (steadier reasoning)
+cclocal --remote http://host:8000         # any remote vLLM endpoint
+cclocal --remote http://host:8000 --remote-model Qwen/Qwen3.6-35B-A3B   # override model
+```
+
+- **Auto-detect.** With no `--remote-model`, the launcher reads the model id
+  from the remote's `/v1/models` and uses it automatically.
+- **Presets.** `--dgx-active` / `--dgx-idle` are convenience aliases — edit the
+  `DGX_ACTIVE` / `DGX_IDLE` addresses near the top of `run.sh` to match your own
+  boxes.
+- **Nothing local runs.** vllm-mlx isn't required in remote mode (only the
+  `claude` CLI). The remote box's own batching handles concurrency, so the
+  single-request OOM safeguards (#7, #17) don't apply.
+- **Reachability.** If the endpoint can't be reached you get a clear error (with
+  a Tailscale hint) instead of a hang.
+
+> **Reasoning models emit `thinking`.** Qwen3-class models return `thinking`
+> blocks; recent vLLM wraps them as *structured* Anthropic `thinking` content
+> (not the raw `<think>` text leak of #3), so Claude Code renders them fine — it
+> only costs latency/tokens. The local `VLLM_MLX_ENABLE_THINKING=false` only
+> affects the local server; it can't reach the remote. On the `/v1/messages`
+> endpoint Claude Code uses, no request parameter disables thinking
+> (`thinking:{type:disabled}`, `reasoning_effort`, `chat_template_kwargs` are all
+> ignored there) — disable it **server-side on the remote box** if you need to.
 
 ---
 
@@ -435,7 +478,7 @@ The fix lands in users' venvs once the branch is merged to
 
 | Variable | Value | Purpose |
 |----------|-------|---------|
-| `ANTHROPIC_BASE_URL` | `http://127.0.0.1:8000` | Point Claude Code at local server |
+| `ANTHROPIC_BASE_URL` | `http://127.0.0.1:8000` (local) or the remote URL with `--remote`/`--dgx-*` | Point Claude Code at the server |
 | `ANTHROPIC_API_KEY` | `not-needed` | Dummy key (real key explicitly unset) |
 | `ANTHROPIC_MODEL` | Full HuggingFace ID | Model identifier |
 | `ANTHROPIC_DEFAULT_*_MODEL` | Same as above | Route all tiers (Opus/Sonnet/Haiku) locally |
