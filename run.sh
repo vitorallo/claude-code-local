@@ -623,8 +623,12 @@ if [[ -n "$REMOTE_URL" ]]; then
     if [[ -n "$REMOTE_MODEL" ]]; then
         MODEL="$REMOTE_MODEL"
     else
+        # Whitespace-tolerant: LM Studio pretty-prints ("id": "x"), vLLM is
+        # compact ("id":"x"). `|| true` keeps a no-match from tripping `set -e`
+        # so the empty-check below reports a clear error instead of a silent bail.
         MODEL=$(curl -s -m 8 "$REMOTE_URL/v1/models" 2>/dev/null \
-            | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+            | grep -oE '"id"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 \
+            | sed -E 's/.*:[[:space:]]*"([^"]*)".*/\1/' || true)
         if [[ -z "$MODEL" ]]; then
             printf "${RED}ERROR: Could not auto-detect a model from $REMOTE_URL/v1/models.${RESET}\n"
             echo "  Pass one explicitly with:  --remote-model <id>"
