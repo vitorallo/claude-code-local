@@ -6,3 +6,6 @@ foil-migration.md
 article.*
 CLAUDE.md
 .claude/
+# Internal working notes — never published to the public mirror
+gemma4-status.md
+narration.md

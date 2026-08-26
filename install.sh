@@ -31,18 +31,34 @@ fi
 echo "  uv: $(uv --version)"
 
 # 2. Create venv and install vllm-mlx
-# Using vitorallo/vllm-mlx fork. Pinned to the fix/gemma4-toolcall-safe-and-faildloud
-# branch (built on claude-code-local-patches) which adds, on top of the base:
-# - All foil-patches-rebased patches (memory warning, /v1/reset, Qwen thinking strip)
-# - Gemma 4 asymmetric channel token stripping (for VLLM_MLX_ENABLE_THINKING=false)
-# - Tool-call-span-safe channel cleaning (D1/D2) + opt-in
-#   --tool-call-truncation-notice (see README #18)
-# claude-code-local-patches itself is intentionally left untouched so other
-# downstream consumers are unaffected until/if this branch is merged there.
+# Using the vitorallo/vllm-mlx fork, branch feat/claude-code-local-0.4.1: a
+# fresh branch off upstream v0.4.1 carrying only three patches that are still
+# absent upstream —
+# - POST /v1/reset (deep cache reset) and health.memory_warning
+# - opt-in --tool-call-truncation-notice: when a tool call is cut off by
+#   max_tokens, return "write it in parts" instead of a silent HTTP 200 or an
+#   unrunnable argument-less tool call (see README #18)
+# - qwen3_xml / qwen3.5 exposed in --tool-call-parser choices
 #
-# To manually roll back to the base branch, swap the line below for:
-# VLLM_MLX_REPO="git+https://github.com/vitorallo/vllm-mlx.git@claude-code-local-patches"
-VLLM_MLX_REPO="git+https://github.com/vitorallo/vllm-mlx.git@fix/gemma4-toolcall-safe-and-faildloud"
+# The old branch was 354 commits behind upstream and hard-pinned
+# mlx==0.31.1 / mlx-lm==0.31.1 to dodge the "no Stream(gpu, N) in current
+# thread" crash. That was upstream issue #407, fixed in PR #452, so the pins
+# are gone and the MLX stack floats again (mlx 0.32.x, mlx-lm 0.31.3+,
+# mlx-vlm 0.6.x) — which is what makes Qwen3.8 loadable.
+#
+# Four Gemma-4 channel-cleaning patches were deliberately NOT carried over:
+# upstream 0.4.1 handles Gemma 4 tool calls with a real gemma4_tool_parser.py
+# rather than text cleaning. If Gemma 4 regresses, they are still on the old
+# branch below.
+#
+# NOTE: if another project on this machine consumes the same fork, it will do
+# so through its own pin (submodule or its own venv). Changing the branch here
+# does not touch it.
+#
+# To roll back, swap the line below for either:
+# VLLM_MLX_REPO="git+https://github.com/vitorallo/vllm-mlx.git@fix/gemma4-toolcall-safe-and-faildloud"  # pre-0.4.1, mlx pinned
+# VLLM_MLX_REPO="git+https://github.com/vitorallo/vllm-mlx.git@claude-code-local-patches"               # older still
+VLLM_MLX_REPO="git+https://github.com/vitorallo/vllm-mlx.git@feat/claude-code-local-0.4.1"
 echo ""
 echo "[2/3] Installing vllm-mlx into local venv..."
 if [[ -d "$VENV_DIR" ]]; then
@@ -56,7 +72,9 @@ fi
 if [[ -x "$VENV_DIR/bin/vllm-mlx" ]]; then
     echo "  vllm-mlx installed: $VENV_DIR/bin/vllm-mlx"
     MLXLM_VER=$("$VENV_DIR/bin/python3" -c "import mlx_lm; print(mlx_lm.__version__)" 2>/dev/null || echo "unknown")
-    echo "  mlx-lm version: $MLXLM_VER"
+    MLX_VER=$("$VENV_DIR/bin/python3" -c "import mlx.core as mx; print(mx.__version__)" 2>/dev/null || echo "unknown")
+    MLXVLM_VER=$("$VENV_DIR/bin/python3" -c "import mlx_vlm; print(mlx_vlm.__version__)" 2>/dev/null || echo "unknown")
+    echo "  mlx: $MLX_VER  |  mlx-lm: $MLXLM_VER  |  mlx-vlm: $MLXVLM_VER"
 else
     echo "  ERROR: vllm-mlx binary not found in venv."
     exit 1
@@ -80,11 +98,15 @@ echo ""
 echo "=== Setup Complete ==="
 echo ""
 echo "Quick start:"
-echo "  cclocal              # Interactive menu"
-echo "  cclocal --gemma-light # Gemma-4-E4B (~5GB, default, clean tool calling)"
-echo "  cclocal --gemma      # Gemma-4-26B-A4B MoE (~16GB)"
-echo "  cclocal --review     # GLM-4.7-Flash (~17GB, stronger reasoning)"
-echo "  cclocal --server     # Server only, connect Claude Code separately"
-echo "  cclocal --clean      # List and delete cached models"
+echo "  cclocal               # Interactive menu"
+echo "  cclocal --qwen38      # Qwen3.8-27B (~16GB, best quality, needs 24GB)"
+echo "  cclocal --gemma-light # Gemma-4-E4B (~5GB, light default, clean tool calling)"
+echo "  cclocal --server      # Server only, connect Claude Code separately"
+echo "  cclocal --clean       # List and delete cached models"
+echo "  cclocal -h            # All models and flags"
+echo ""
+echo "On a 24GB Mac, --qwen38 will offer to raise the GPU memory limit at"
+echo "startup. Take it (option 2 or 3) — 16GB of weights against the ~19GB"
+echo "default budget leaves very little room for the context cache."
 echo ""
 echo "Or run directly: ./run.sh"

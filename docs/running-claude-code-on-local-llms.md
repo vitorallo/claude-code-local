@@ -210,3 +210,69 @@ and diagnosable, (b) right-sizing budgets to the hardware, (c) pinning a
 fragile runtime, and (d) being honest about the model-capability ceiling
 instead of engineering around it. That is the actual cost of "local Claude
 Code", and it is mostly invisible until you hit each wall in turn.
+
+---
+
+## Postscript (August 2026): the ceiling moved
+
+Everything above was written against a pinned engine and a model that could not
+reliably escape JSON. Three months later, both premises are gone.
+
+**The pin is lifted.** The dependency pin this report defends —
+`mlx==0.31.1` / `mlx-lm==0.31.1` / `mlx-vlm<0.5.0` — existed solely to dodge
+`RuntimeError: There is no Stream(gpu, N) in current thread`, which we never
+root-caused locally. It was
+[vllm-mlx issue #407](https://github.com/waybarrios/vllm-mlx/issues/407), fixed
+upstream on 2026-04-24 in PR #452: three stream-ownership fixes (running
+`prepare_for_start` inline on the event-loop thread instead of `to_thread`, a
+`ResidencyManager` thread-divergence guard, and an explicit stream rebind in
+`stream_generate`). "Pinned, reproducible ML dependency stack" was the right
+call at the time and the wrong thing to keep. The stack now floats at
+mlx 0.32.x / mlx-lm 0.31.3+ / mlx-vlm 0.6.x.
+
+**The model-capability ceiling was an encoding problem.** The report's central
+conclusion — that the last wall is a 4-bit model failing to `\"`-escape quotes
+inside a long file body, and that *"the biggest lever is the model, not the
+RAM"* — turns out to be half right in an instructive way. The lever was indeed
+the model, but not because a bigger model escapes JSON better. It is because
+**Qwen3.8 doesn't emit JSON at all**:
+
+```
+<tool_call>
+<function=Write>
+<parameter=content>...the file body, verbatim, unescaped...</parameter>
+</function>
+</tool_call>
+```
+
+The model writes raw bytes; the server's `qwen3_xml` parser does the JSON
+encoding. A failure mode we had classified as *"a model capability limit no
+server patch fixes"* was really a wire-format choice. Verified: a 48-line
+module with 58 double quotes, nested escaped quotes and `\n` sequences
+round-tripped cleanly into a file that compiles and runs.
+
+**Notably, Qwen3.8-27B loaded with no new architecture code.** Its
+`config.json` declares `model_type: qwen3_5`, so the existing
+`mlx_lm/models/qwen3_5.py` runs it unchanged — and on this Mac it loads down
+the *text-only* path (`MLLM=False`), leaving the vision tower out of memory.
+
+**A new failure mode, same shape as the old ones.** The XML format moved the
+truncation failure rather than removing it. Cut off mid-call, the parser still
+recognises `<function=Write>` and emits a tool call built from whatever
+arrived — either with empty arguments, or with a JSON fragment that never
+closes. Both are *worse* than the silent HTTP-200 text this report catalogues:
+the agent runs `Write` with no arguments, or writes a silently truncated file
+believing it succeeded. The fail-loud notice had to be re-gated on
+**completeness rather than presence** (arguments must parse as JSON and be
+non-empty), and to drop the shells when it fires.
+
+That is the pattern this report opened with, holding as well as ever: every
+wall, once climbed, reveals the same failure *shape* one layer down — something
+went wrong quietly and looked like a different layer's fault.
+
+**What did not change.** The arithmetic. An artifact larger than the
+output-token budget still cannot be emitted in one call, on any engine. And
+speed is now the binding constraint rather than correctness: Qwen3.8-27B at
+4-bit runs ~7.5 tok/s on an M5 with 24GB, against 16.05GB of weights and a
+~19GB GPU budget. The honest summary is that local Claude Code has moved from
+*"wrong in ways you can't see"* to *"right but slow"* — a much better problem.
