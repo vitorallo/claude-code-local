@@ -1,10 +1,29 @@
 # Claude-Code-Local
 
-**The only setup that actually works.** Run Claude Code with local LLMs on Apple Silicon — real tool execution, real agentic loops, fully offline.
+Run Claude Code against a local model on Apple Silicon — real tool execution,
+real agentic loops, fully offline.
 
-Every tutorial out there tells you to point Claude Code at Ollama or llama.cpp and call it a day. None of them work. The model generates text that *looks like* a tool call, but nothing executes. No files get created, no commands run, no code gets written. You're watching a convincing hallucination.
+**Things have changed.** This project started when pointing Claude Code at a
+local backend reliably produced a convincing hallucination: the model emitted
+text that *looked like* a tool call, nothing executed, no files appeared.
+That is no longer the state of the world. **LM Studio and Ollama both now serve
+a native Anthropic `/v1/messages` endpoint**, and both work. If you already run
+one of them, try it first — it is less setup than this.
 
-This project uses [vllm-mlx](https://github.com/waybarrios/vllm-mlx) — the only backend that speaks Claude Code's native language: the Anthropic Messages API with real `tool_use` content blocks. When the model decides to read a file, it actually reads the file. When it writes code, the code lands on disk. The agentic loop works — tool calls chain into tool results, the model iterates, and you get the real Claude Code experience running entirely on your hardware.
+What this project still gives you is a tuned path rather than a generic one.
+`cclocal` wraps [vllm-mlx](https://github.com/waybarrios/vllm-mlx) with a model
+catalog where each entry carries the tool-call parser, reasoning parser and KV
+bound that model actually needs; a memory preflight sized to Apple's GPU budget
+rather than free RAM; and a set of Claude Code environment fixes for problems
+that are invisible from the client side. Most of this README is the catalogue
+of those problems — [31 of them](#why-this-is-hard-and-how-we-solved-it), each
+with the measurement behind it. Much of it applies whichever backend you pick.
+
+It also carries a fork of vllm-mlx with fixes not yet upstream — see
+[#19](#19-system-message-must-be-at-the-beginning-opaque-http-500),
+[#21](#21-concurrent-requests-rejected-mid-session-api-error) and
+[#31](#31-every-tool-request-returns-http-500-union-types-in-tool-schemas) —
+each of which presented as a generic "API error" until the server log was read.
 
 No API key. No cloud. No subscription. No data leaves your machine. Just `./install.sh` and go.
 
@@ -502,11 +521,12 @@ working — check that `--tool-call-parser` is set.
 
 ```bash
 cclocal                # Interactive menu: pick model, see what's cached, manage cache
+cclocal --deckard      # Direct launch, Qwen3.5-9B-Deckard-Agent (recommended)
 cclocal --qwen38       # Direct launch, Qwen3.8-27B (best quality, 24GB)
 cclocal --gemma-light  # Direct launch, Gemma-4-E4B (light default, clean tool calling)
-cclocal --gemma        # Direct launch, Gemma-4-26B MoE
-cclocal --review       # Direct launch, GLM-4.7-Flash
-cclocal --coder        # Direct launch, Qwen3-Coder-30B-A3B
+cclocal --gemma        # Direct launch, Gemma-4-26B MoE (best big model on 24GB)
+cclocal --qwen3        # Direct launch, stock Qwen3.5-9B
+cclocal --coder        # Direct launch, Qwen3-Coder-30B-A3B (untested, 32GB+)
 cclocal --list         # List cached models on disk
 cclocal --rm           # Manage/delete cached models (interactive)
 cclocal --server       # Start server only, connect Claude Code separately
@@ -652,15 +672,74 @@ cclocal --remote http://host:8000 --remote-model Qwen/Qwen3.6-35B-A3B   # overri
 
 ## Why this is hard (and how we solved it)
 
-Running Claude Code with a local model isn't just "point it at localhost". There are 31 problems that break the experience. This section documents every one and how `run.sh` handles it.
+Running Claude Code against a local model is not "point it at localhost". Every
+entry below is a failure that was hit in practice, with the measurement behind
+it and what fixes it. Several present identically from the client — a generic
+"API error" or "check your network" — which is why the first step for any of
+them is reading `server.log`.
+
+<details>
+<summary><strong>All 31 problems</strong> (click to expand)</summary>
+
+1. [Fake tool calls (historical — fixed upstream)](#1-fake-tool-calls-historical-fixed-upstream)
+2. [`end_turn` vs `stop` (the loop killer)](#2-end_turn-vs-stop-the-loop-killer)
+3. [Reasoning/thinking tokens (garbage output)](#3-reasoningthinking-tokens-garbage-output)
+4. [KV cache invalidation (90% slowdown)](#4-kv-cache-invalidation-90-slowdown)
+5. [Background Haiku model calls (crash)](#5-background-haiku-model-calls-crash)
+6. [Token counting endpoint (silent failure)](#6-token-counting-endpoint-silent-failure)
+7. [Concurrent requests OOM](#7-concurrent-requests-oom)
+8. [Streaming format mismatches (partial responses)](#8-streaming-format-mismatches-partial-responses)
+9. [Tool flooding (259 tools overwhelm local models)](#9-tool-flooding-259-tools-overwhelm-local-models)
+10. [Real API key leaking to local server](#10-real-api-key-leaking-to-local-server)
+11. [Autoupdater and telemetry (network-dependent startup)](#11-autoupdater-and-telemetry-network-dependent-startup)
+12. [Memory pressure on 24GB](#12-memory-pressure-on-24gb)
+13. [vllm-mlx critical bug: missing `return` statement (historical)](#13-vllm-mlx-critical-bug-missing-return-statement-historical)
+14. [Health endpoint mismatch](#14-health-endpoint-mismatch)
+15. [Model name `default` not recognized](#15-model-name-default-not-recognized)
+16. [First-run model download looks like a hang](#16-first-run-model-download-looks-like-a-hang)
+17. [OOM crash under agentic load — memory preflight](#17-oom-crash-under-agentic-load-memory-preflight)
+18. [Write/Edit tool call silently does nothing (no error)](#18-writeedit-tool-call-silently-does-nothing-no-error)
+19. ["System message must be at the beginning" (opaque HTTP 500)](#19-system-message-must-be-at-the-beginning-opaque-http-500)
+20. [Claude Code assumes a 200k context window](#20-claude-code-assumes-a-200k-context-window)
+21. [Concurrent requests rejected mid-session ("API error")](#21-concurrent-requests-rejected-mid-session-api-error)
+22. [Sampling flags silently disable the system prompt cache](#22-sampling-flags-silently-disable-the-system-prompt-cache)
+23. [Everything works but is unusably slow (cache budget vs. weights)](#23-everything-works-but-is-unusably-slow-cache-budget-vs-weights)
+24. [The 3-bit quant is broken — don't use it](#24-the-3-bit-quant-is-broken-dont-use-it)
+25. [Sizing the system-prompt cache (corrected)](#25-sizing-the-system-prompt-cache-corrected)
+26. [Qwen3.8 on 24GB: the honest verdict](#26-qwen38-on-24gb-the-honest-verdict)
+27. [Gemma narrates instead of acting, and the loop stalls](#27-gemma-narrates-instead-of-acting-and-the-loop-stalls)
+28. [Client gives up on a long generation](#28-client-gives-up-on-a-long-generation)
+29. [Two cclocal sessions fight over port 8000](#29-two-cclocal-sessions-fight-over-port-8000)
+30. [Evaluating a new model: check that it *writes files*, not that it answers](#30-evaluating-a-new-model-check-that-it-writes-files-not-that-it-answers)
+31. [Every tool request returns HTTP 500 (union types in tool schemas)](#31-every-tool-request-returns-http-500-union-types-in-tool-schemas)
+
+</details>
 
 > 📄 For a consolidated field report — every problem tackled, root causes, the fixes/improvements, the honest model-capability limits, and how it scales to larger hardware — see [`docs/running-claude-code-on-local-llms.md`](docs/running-claude-code-on-local-llms.md).
 
-### 1. Ollama can't produce real tool calls
+### 1. Fake tool calls (historical — fixed upstream)
 
-**Problem**: Ollama's Anthropic API adapter generates text that *looks like* tool calls but never emits real `tool_use` content blocks. Claude Code receives plain text, never executes anything. Tested with qwen3.5:9b, qwen3.5:35b-a3b, glm-4.7-flash — all produce fake tool calls.
+**Problem**: an Anthropic-compatible adapter that generates text *looking like*
+a tool call but never emits a real `tool_use` content block. Claude Code
+receives plain text and executes nothing. This was Ollama's behaviour when this
+project started, reproduced across qwen3.5:9b, qwen3.5:35b-a3b and
+glm-4.7-flash.
 
-**Solution**: Use vllm-mlx. It implements the native Anthropic Messages API with real `tool_use` / `tool_result` content blocks.
+**Status: no longer true.** Both Ollama and LM Studio now serve a native
+Anthropic `/v1/messages` endpoint with real `tool_use` / `tool_result` blocks,
+and both work with Claude Code. The entry is kept because the *failure mode*
+still matters: it is the first thing to check with any new backend or model,
+and it is exactly how the two models rejected in
+[#24](#24-the-3-bit-quant-is-broken-dont-use-it) and
+[#30](#30-evaluating-a-new-model-check-that-it-writes-files-not-that-it-answers)
+failed — emitting a markdown code block where a tool call belonged.
+
+The one-line check, whatever backend you are on:
+
+```bash
+grep -o '"type": "tool_use"' out.txt   # must be present
+grep -o '```python' out.txt            # must NOT be present
+```
 
 ### 2. `end_turn` vs `stop` (the loop killer)
 
@@ -1516,7 +1595,7 @@ Every entry in the table below was first diagnosed that way.
 | Qwen3.8 thinks for minutes before doing anything | Thinking left on at the model's `xhigh` default | Don't pass `--think`. Off is the default; `--think` uses `reasoning_effort=low` — see [#3](#3-reasoningthinking-tokens-garbage-output) |
 | Tool call returns "⚠ The previous tool call was discarded…" | A tool call was truncated by the output-token cap | Working as intended — that's the fail-loud notice. Raise `--out-tokens 16384`, or let the model write the file in sections — see [#18](#18-writeedit-tool-call-silently-does-nothing-no-error) |
 | vllm-mlx crashes on startup (TypeError: NoneType) | Using unpatched upstream | `./install.sh` installs from our fork which has the fix |
-| Model generates text about tools but nothing executes | Using Ollama | Switch to vllm-mlx — Ollama can't produce real tool_use blocks |
+| Model generates text about tools but nothing executes | The model emitted a markdown block instead of a tool call | Check with the one-liner in [#1](#1-fake-tool-calls-historical-fixed-upstream); if the model does this consistently it can't drive Claude Code — see [#30](#30-evaluating-a-new-model-check-that-it-writes-files-not-that-it-answers) |
 | Metal GPU OOM crash under load (`kIOGPUCommandBufferCallbackErrorOutOfMemory`) | Large model + growing agentic context exceeds the GPU budget; the prefix cache costs its size twice at peak | On 24GB with a 16GB model this is expected in a real session — use `--gemma-light`, see [#26](#26-qwen38-on-24gb-the-honest-verdict) and #17 |
 | First run hangs at "Waiting for server..." | Multi-GB model still downloading from HuggingFace | It's not hung — a live download progress line now shows; partial downloads resume — see #16 |
 | Write/Edit tool call shows then silently does nothing (no error) | Large tool-call output truncated by the token cap (+ fork channel-filter) | `--out-tokens 16384`, or use `gemma-light`/a coder model; inspect `server.log.1` — see #18 |
@@ -1628,7 +1707,8 @@ seven, keeping them the same length.
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) — Anthropic's CLI for Claude
 - [Why Claude Code Fails with Local LLMs](https://explore.n1n.ai/blog/why-claude-code-fails-local-llm-inference-2026-02-19) — Detailed failure analysis
 - [Claude Code tool flooding issue](https://github.com/anthropics/claude-code/issues/25857) — 259 tools sent to local models
-- [Ollama Anthropic Compatibility](https://docs.ollama.com/api/anthropic-compatibility) — Confirmed broken for tool_use
+- [Ollama Anthropic compatibility](https://docs.ollama.com/api/anthropic-compatibility) — native `/v1/messages`; an alternative to this setup
+- [LM Studio + Claude Code](https://lmstudio.ai/blog/claudecode) — native `/v1/messages` since 0.4.1; also an alternative
 
 ---
 
