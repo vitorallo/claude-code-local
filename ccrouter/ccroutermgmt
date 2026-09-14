@@ -1,0 +1,14 @@
+#!/bin/bash
+# ccroutermgmt — full-screen manager for ccrouter: providers, profiles, keys,
+# and a live view of what the router is doing. Installed as ~/.local/bin/ccroutermgmt.
+self="$0"
+while [[ -L "$self" ]]; do
+    link="$(readlink "$self")"
+    if [[ "$link" == /* ]]; then self="$link"; else self="$(dirname "$self")/$link"; fi
+done
+DIR="$(cd "$(dirname "$self")" && pwd)"
+if [[ ! -x "$DIR/.venv/bin/python3" ]]; then
+    echo "ccroutermgmt: ccrouter venv not found — run ./install.sh first" >&2
+    exit 1
+fi
+exec "$DIR/.venv/bin/python3" "$DIR/ccroutermgmt.py" "$@"

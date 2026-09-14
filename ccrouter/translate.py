@@ -45,6 +45,26 @@ def tool_id(original):
     return hashlib.sha256(original.encode()).hexdigest()[:9]
 
 
+# OpenAI-style APIs (NVIDIA, Mistral, ...) accept tool names matching this.
+# MCP tools are named mcp__<server>__<tool> and can be longer, or contain dots.
+TOOL_NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def tool_name(original):
+    """A provider-safe tool name. Unchanged when already valid; otherwise cleaned,
+    cut to fit and suffixed with a hash so it stays unique and deterministic."""
+    original = original or "tool"
+    if TOOL_NAME.match(original):
+        return original
+    clean = re.sub(r"[^A-Za-z0-9_-]", "_", original)
+    return f"{clean[:55]}_{hashlib.sha256(original.encode()).hexdigest()[:8]}"
+
+
+def tool_name_map(body):
+    """Provider-safe name -> Claude Code's name, for the tools in this request."""
+    return {tool_name(t["name"]): t["name"] for t in body.get("tools") or [] if t.get("name")}
+
+
 def new_message_id():
     return "msg_" + uuid.uuid4().hex[:24]
 
@@ -86,22 +106,31 @@ def _user_content(parts):
     return parts
 
 
-def convert_messages(body):
+IMAGE_OMITTED = ("[image omitted: this model can't read images — use a text alternative, "
+                 "e.g. Playwright's browser_snapshot instead of a screenshot]")
+
+
+def convert_messages(body, vision=True):
+    # Text-only models (most free ones) reject a request containing an image.
+    image = _image_part if vision else (lambda block: {"type": "text", "text": IMAGE_OMITTED})
     out = []
-    # Claude Code also puts system-role messages inside messages[] (environment
-    # info, reminders). Many OpenAI-style servers reject a system message that
-    # isn't first, so they are hoisted into the one system prompt at the top.
-    system_parts = [_text_of(body.get("system") or "")]
-    system_parts += [_text_of(m.get("content")) for m in body.get("messages") or [] if m.get("role") == "system"]
-    system_text = BILLING_HEADER.sub("", "\n\n".join(p for p in system_parts if p.strip())).strip()
+    system_text = BILLING_HEADER.sub("", _text_of(body.get("system") or "")).strip()
     if system_text:
         out.append({"role": "system", "content": system_text})
 
     for message in body.get("messages") or []:
         role = message.get("role", "user")
-        if role == "system":
-            continue
         content = message.get("content")
+        if role == "system":
+            # Claude Code also puts system-role messages inside messages[]
+            # (environment info, reminders). Many OpenAI-style servers reject a
+            # system message that isn't first. Hoisting them into the top prompt
+            # would change the prompt prefix and defeat the provider's prefix
+            # cache, so they stay where they are, as user-role text.
+            text = _text_of(content).strip()
+            if text:
+                out.append({"role": "user", "content": f"<system-reminder>\n{text}\n</system-reminder>"})
+            continue
         if isinstance(content, str):
             out.append({"role": role, "content": content})
             continue
@@ -117,7 +146,7 @@ def convert_messages(body):
                         "id": tool_id(block.get("id")),
                         "type": "function",
                         "function": {
-                            "name": block.get("name"),
+                            "name": tool_name(block.get("name")),
                             "arguments": json.dumps(block.get("input") or {}, ensure_ascii=False),
                         },
                     })
@@ -137,7 +166,7 @@ def convert_messages(body):
                 result = block.get("content")
                 if isinstance(result, list):
                     text = "\n".join(x.get("text", "") for x in result if x.get("type") == "text")
-                    lifted += [_image_part(x) for x in result if x.get("type") == "image"]
+                    lifted += [image(x) for x in result if x.get("type") == "image"]
                 else:
                     text = result or ""
                 if block.get("is_error"):
@@ -146,7 +175,7 @@ def convert_messages(body):
             elif kind == "text":
                 parts.append({"type": "text", "text": block.get("text", "")})
             elif kind == "image":
-                parts.append(_image_part(block))
+                parts.append(image(block))
         out += results
         if lifted:
             out.append({"role": "user", "content": [{"type": "text", "text": "Images returned by the tool:"}] + lifted})
@@ -187,14 +216,14 @@ def convert_tools(tools):
         if schema.get("type") == "object" and "properties" not in schema:
             schema["properties"] = {}
         out.append({"type": "function", "function": {
-            "name": tool["name"], "description": tool.get("description") or "", "parameters": schema}})
+            "name": tool_name(tool["name"]), "description": tool.get("description") or "", "parameters": schema}})
     return out
 
 
 def convert_tool_choice(choice):
     kind = (choice or {}).get("type")
     if kind == "tool":
-        return {"type": "function", "function": {"name": choice.get("name")}}
+        return {"type": "function", "function": {"name": tool_name(choice.get("name"))}}
     return {"auto": "auto", "any": "required", "none": "none"}.get(kind)
 
 
@@ -206,9 +235,9 @@ def _merge(dst, src):
             dst[key] = value
 
 
-def to_openai(body, model, max_output=None, extra_body=None):
+def to_openai(body, model, max_output=None, extra_body=None, vision=True):
     stream = bool(body.get("stream"))
-    request = {"model": model, "messages": convert_messages(body), "stream": stream}
+    request = {"model": model, "messages": convert_messages(body, vision), "stream": stream}
     if body.get("max_tokens"):
         request["max_tokens"] = min(body["max_tokens"], max_output) if max_output else body["max_tokens"]
     for key in ("temperature", "top_p"):
@@ -250,9 +279,16 @@ def parse_arguments(raw):
 
 
 def usage_of(usage):
+    """OpenAI usage -> Anthropic usage. Providers that prefix-cache report the
+    cached part in prompt_tokens_details.cached_tokens; Anthropic counts it
+    separately as cache_read_input_tokens, outside input_tokens."""
     usage = usage or {}
-    return {"input_tokens": int(usage.get("prompt_tokens") or 0),
-            "output_tokens": int(usage.get("completion_tokens") or 0)}
+    prompt = int(usage.get("prompt_tokens") or 0)
+    cached = int((usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0)
+    result = {"input_tokens": prompt - cached, "output_tokens": int(usage.get("completion_tokens") or 0)}
+    if cached:
+        result["cache_read_input_tokens"] = cached
+    return result
 
 
 def stop_reason_of(finish_reason, has_tools):
@@ -261,7 +297,9 @@ def stop_reason_of(finish_reason, has_tools):
     return STOP_REASONS.get(finish_reason, "end_turn")
 
 
-def from_openai(response, model):
+def from_openai(response, model, names=None):
+    """`names` maps provider-safe tool names back to Claude Code's (tool_name_map)."""
+    names = names or {}
     choice = (response.get("choices") or [{}])[0]
     message = choice.get("message") or {}
     content = []
@@ -270,7 +308,8 @@ def from_openai(response, model):
     for call in message.get("tool_calls") or []:
         fn = call.get("function") or {}
         content.append({"type": "tool_use", "id": call.get("id") or new_tool_id(),
-                        "name": fn.get("name"), "input": parse_arguments(fn.get("arguments"))})
+                        "name": names.get(fn.get("name"), fn.get("name")),
+                        "input": parse_arguments(fn.get("arguments"))})
     has_tools = any(b["type"] == "tool_use" for b in content)
     return {
         "id": new_message_id(), "type": "message", "role": "assistant", "model": model,
@@ -294,8 +333,9 @@ class StreamTranslator:
     the whole growing argument string.
     """
 
-    def __init__(self, model):
+    def __init__(self, model, names=None):
         self.model = model
+        self.names = names or {}  # provider-safe tool name -> Claude Code's
         self.message_id = new_message_id()
         self.started = False
         self.closed = False
@@ -366,7 +406,7 @@ class StreamTranslator:
         return events
 
     def tool_blocks(self):
-        return [{"type": "tool_use", "id": s["id"] or new_tool_id(), "name": s["name"],
+        return [{"type": "tool_use", "id": s["id"] or new_tool_id(), "name": self.names.get(s["name"], s["name"]),
                  "input": parse_arguments(s["args"])}
                 for _, s in sorted(self.tools.items())]
 

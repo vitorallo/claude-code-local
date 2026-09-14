@@ -56,6 +56,17 @@ thinking off via `chat_template_kwargs.enable_thinking=false`; `stream_options` 
 - [x] Root README: ccrouter section + flag row
 - [x] Public mirror: publish code/docs/example config only; verify no real key before push; fresh clone passes tests
 
+### Speed and management (round 2)
+- [x] `cclocal` passes `--no-chrome` by default (`--chrome` opts back in): 30 → 8 tools, ~14.7k → ~4.9k input tokens
+- [x] Prompt caching left on with `--ccrouter`; system reminders kept in place so the prefix stays cacheable;
+      cached tokens reported (NVIDIA confirmed: 4,320 of 9,406 cached on a repeat)
+- [x] Measured NVIDIA free tier: Super ~0.5 s, Lightning ~30 s, Ultra ~65 s → Super is profile 1
+- [x] Failover on overload (503/529) and slow start (`first_token_timeout`), plus retry on dropped idle connections
+- [x] `enabled: false` profiles; admin endpoints `/admin/status`, `/admin/reload`, `/admin/activate`
+- [x] `providers.yaml` catalog (14 providers) from OmniRoute, with our probe results for the keyless ones
+- [x] `ccroutermgmt` TUI (textual): Profiles / Add provider / Live log; headless smoke test passes
+- [ ] Try it interactively in a real terminal and tune the layout
+
 ### Later (not now)
 - [ ] `show_thinking` option: emit reasoning as Anthropic thinking blocks
 - [ ] Try keyless providers (ovhcloud, pollinations) for tool calling and document results

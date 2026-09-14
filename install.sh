@@ -90,9 +90,9 @@ if [[ ! -d "$CCROUTER_DIR/.venv" ]]; then
 fi
 uv pip install --python "$CCROUTER_DIR/.venv/bin/python3" -r "$CCROUTER_DIR/requirements.txt"
 if [[ ! -f "$CCROUTER_DIR/config.yaml" ]]; then
-    cp "$CCROUTER_DIR/config.example.yaml" "$CCROUTER_DIR/config.yaml"
+    cp "$CCROUTER_DIR/config.yaml.example" "$CCROUTER_DIR/config.yaml"
     chmod 600 "$CCROUTER_DIR/config.yaml"
-    echo "  Created ccrouter/config.yaml — add your API key(s) before using --ccrouter"
+    echo "  Created ccrouter/config.yaml — run ccroutermgmt to paste your API key(s) before using --ccrouter"
 fi
 
 # 4. Create cclocal symlink
@@ -101,6 +101,8 @@ echo "[4/4] Creating cclocal command..."
 mkdir -p ~/.local/bin
 ln -sf "$SCRIPT_DIR/run.sh" ~/.local/bin/cclocal
 echo "  Symlinked: ~/.local/bin/cclocal -> $SCRIPT_DIR/run.sh"
+ln -sf "$CCROUTER_DIR/ccroutermgmt" ~/.local/bin/ccroutermgmt
+echo "  Symlinked: ~/.local/bin/ccroutermgmt -> $CCROUTER_DIR/ccroutermgmt"
 
 if ! echo "$PATH" | tr ':' '\n' | grep -qx "$HOME/.local/bin"; then
     echo ""
@@ -117,6 +119,7 @@ echo "  cclocal               # Interactive menu"
 echo "  cclocal --qwen38      # Qwen3.8-27B (~16GB, best quality, needs 24GB)"
 echo "  cclocal --gemma-light # Gemma-4-E4B (~5GB, light default, clean tool calling)"
 echo "  cclocal --ccrouter    # Hosted provider via ccrouter (edit ccrouter/config.yaml)"
+echo "  ccroutermgmt          # Manage ccrouter providers/keys and watch its live log"
 echo "  cclocal --server      # Server only, connect Claude Code separately"
 echo "  cclocal --clean       # List and delete cached models"
 echo "  cclocal -h            # All models and flags"

@@ -198,7 +198,7 @@ tui_leave() { tput cnorm 2>/dev/null || true; clear 2>/dev/null || printf '\n'; 
 
 print_header() {
     printf "\n${BOLD}${BLUE}╭────────────────────────────────────────────────╮${RESET}\n"
-    printf "${BOLD}${BLUE}│${RESET}  ${BOLD}Claude Code Local${RESET} ${DIM}— vllm-mlx on Apple Silicon${RESET}  ${BOLD}${BLUE}│${RESET}\n"
+    printf "${BOLD}${BLUE}│${RESET}  ${BOLD}Claude Code Local${RESET} ${DIM}— vllm-mlx on Apple Silicon${RESET} ${BOLD}${BLUE}│${RESET}\n"
     printf "${BOLD}${BLUE}╰────────────────────────────────────────────────╯${RESET}\n\n"
 }
 
@@ -714,10 +714,19 @@ ${BOLD}Remote backend${RESET} ${DIM}(skip the local server, connect to a remote 
   --ccrouter [N|R]
                   Hosted providers (NVIDIA Nemotron, Groq, ...) through the
                   ${DIM}local ccrouter on port $CCROUTER_PORT. N = profile number in${RESET}
-                  ${DIM}ccrouter/config.yaml (default 1), R = random. Stays on that${RESET}
-                  ${DIM}profile until it hits a rate/credit limit, then rotates.${RESET}
+                  ${DIM}ccrouter/config.yaml, R = random, nothing = choose from a menu.${RESET}
+                  ${DIM}Stays on that profile until it hits a limit, is overloaded${RESET}
+                  ${DIM}or too slow, then rotates. Manage profiles with ccroutermgmt.${RESET}
 
 ${BOLD}Other${RESET}
+  --chrome        Keep the Claude in Chrome browser tools. Off by default:
+                  ${DIM}they add ~22 tools (~14k tokens) to every request.${RESET}
+  --mcp           Load your usual MCP servers and plugins (Playwright,
+                  ${DIM}Context7, ...). Off by default: each tool's definition is sent${RESET}
+                  ${DIM}with every request, which small local models can't take.${RESET}
+  --mcp-config FILE
+                  Load only the MCP servers in FILE, e.g.
+                  ${DIM}--mcp-config $SCRIPT_DIR/mcp-playwright.json${RESET}
   -h, --help      Show this help
 
 ${BOLD}Examples${RESET}
@@ -733,8 +742,10 @@ ${BOLD}Examples${RESET}
   cclocal --api 192.168.1.50  ${DIM}# any Anthropic-API box, port $API_DEFAULT_PORT${RESET}
   cclocal --dgx-active     ${DIM}# remote DGX Spark (MoE box)${RESET}
   cclocal --remote http://host:8000  ${DIM}# any remote vLLM box${RESET}
-  cclocal --ccrouter       ${DIM}# hosted provider, ccrouter profile 1${RESET}
+  cclocal --ccrouter       ${DIM}# hosted provider, choose the profile from a menu${RESET}
+  cclocal --ccrouter 1     ${DIM}# ...straight to profile 1${RESET}
   cclocal --ccrouter R     ${DIM}# ...starting on a random profile${RESET}
+  cclocal --ccrouter --mcp ${DIM}# ...with your MCP servers (Playwright, ...)${RESET}
 EOF
 }
 
@@ -778,6 +789,9 @@ API_TARGET=""      # the raw --api argument, kept for the error message
 REMOTE_CTX=""      # remote's max_model_len, read from /v1/models
 REMOTE_MAX_OUT=""  # remote's max_output_tokens, if it advertises one (ccrouter does)
 CCROUTER_PROFILE="" # --ccrouter: profile number or R; empty = not using ccrouter
+USE_CHROME=false   # --chrome: keep Claude in Chrome's browser tools (off by default)
+MCP_MODE=none      # --mcp: your usual MCP servers/plugins · --mcp-config FILE: only those
+MCP_USER_CONFIG="" # the FILE given to --mcp-config
 EFFORT_LEVEL=""    # --effort; else derived from --think below
 ENABLE_THINKING=false   # --think: reasoning_effort=low instead of no thinking
 TOOL_PARSER="auto"      # resolved from the catalog once MODEL is known
@@ -832,8 +846,8 @@ while [[ $# -gt 0 ]]; do
             fi
             ;;
         --ccrouter)
-            # --ccrouter [N|R]  profile number (default 1) or R for random
-            CCROUTER_PROFILE=1
+            # --ccrouter [N|R]  profile number, R for random, nothing = pick from a menu
+            CCROUTER_PROFILE=ask
             if [[ $# -gt 1 && "$2" =~ ^([Rr]|[0-9]+)$ ]]; then
                 CCROUTER_PROFILE="$2"
                 shift
@@ -842,6 +856,17 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --think)         ENABLE_THINKING=true; shift ;;
+        --chrome)        USE_CHROME=true; shift ;;
+        --mcp)           MCP_MODE=all; shift ;;
+        --mcp-config)
+            if [[ $# -lt 2 || ! -f "$2" ]]; then
+                printf "${RED}ERROR: --mcp-config needs an existing JSON file, e.g. --mcp-config $SCRIPT_DIR/mcp-playwright.json${RESET}\n" >&2
+                exit 1
+            fi
+            MCP_MODE=file
+            MCP_USER_CONFIG="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"
+            shift 2
+            ;;
         --effort)        EFFORT_LEVEL="$2"; shift 2 ;;
         --no-mem-check) CCLOCAL_NO_MEMCHECK=1; shift ;;
         --safe)         CCLOCAL_FORCE_MEMCHECK=1; shift ;;
@@ -928,7 +953,7 @@ if [[ -n "$CCROUTER_PROFILE" ]]; then
     fi
     if [[ ! -f "$CCROUTER_DIR/config.yaml" ]]; then
         printf "${RED}ERROR: $CCROUTER_DIR/config.yaml not found.${RESET}\n"
-        echo "  cp $CCROUTER_DIR/config.example.yaml $CCROUTER_DIR/config.yaml && chmod 600 $CCROUTER_DIR/config.yaml"
+        echo "  cp $CCROUTER_DIR/config.yaml.example $CCROUTER_DIR/config.yaml && chmod 600 $CCROUTER_DIR/config.yaml"
         echo "  then put your API key(s) in it."
         exit 1
     fi
@@ -939,6 +964,29 @@ if [[ -n "$CCROUTER_PROFILE" ]]; then
     fi
     # Surface config errors here rather than in a log file.
     "$CCROUTER_PY" "$CCROUTER_DIR/ccrouter.py" list >/dev/null || exit 1
+
+    # No profile given: a small menu (ccroutermgmt pick) in a terminal, profile 1 otherwise.
+    if [[ "$CCROUTER_PROFILE" == ask ]]; then
+        if [[ -t 0 && -t 1 ]]; then
+            _pick_file=$(mktemp -t ccrouter-pick)
+            set +e
+            "$CCROUTER_DIR/ccroutermgmt" pick --out "$_pick_file"
+            _pick_rc=$?
+            set -e
+            CCROUTER_PROFILE=$(cat "$_pick_file" 2>/dev/null || true)
+            rm -f "$_pick_file"
+            if [[ -z "$CCROUTER_PROFILE" ]]; then
+                if [[ $_pick_rc -eq 130 ]]; then
+                    echo "No profile chosen."
+                    exit 0
+                fi
+                printf "${YELLOW}Profile menu unavailable (exit $_pick_rc) — starting on profile 1.${RESET}\n"
+                CCROUTER_PROFILE=1
+            fi
+        else
+            CCROUTER_PROFILE=1
+        fi
+    fi
 
     mkdir -p "$CCROUTER_DIR/logs"
     trap _stop_ccrouter EXIT   # replaced by cleanup() below, which also calls it
@@ -1255,7 +1303,10 @@ fi
 # --server print-out and the in-process launch cannot drift apart.
 CLAUDE_ENV=(
     "ANTHROPIC_BASE_URL=$BASE_URL"
-    "ANTHROPIC_API_KEY=not-needed"
+    # A dummy credential so Claude Code needs no Anthropic account or login. It goes in
+    # ANTHROPIC_AUTH_TOKEN, not ANTHROPIC_API_KEY: an API key makes a fresh install ask
+    # "Detected a custom API key — use it?" with No pre-selected, and No leads to the login screen.
+    "ANTHROPIC_AUTH_TOKEN=not-needed"
     "ANTHROPIC_MODEL=$MODEL"
     "ANTHROPIC_DEFAULT_OPUS_MODEL=$MODEL"
     "ANTHROPIC_DEFAULT_SONNET_MODEL=$MODEL"
@@ -1283,7 +1334,6 @@ CLAUDE_ENV=(
     "API_FORCE_IDLE_TIMEOUT=0"
     "CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS=1800000"
     "CLAUDE_CODE_ATTRIBUTION_HEADER=0"
-    "DISABLE_PROMPT_CACHING=1"
     "DISABLE_AUTOUPDATER=1"
     "DISABLE_TELEMETRY=1"
     "DISABLE_ERROR_REPORTING=1"
@@ -1300,8 +1350,6 @@ CLAUDE_ENV=(
 _WRITE_IN_PARTS_GUIDANCE="When creating or substantially editing a file longer than ~150 lines, do NOT emit it in a single Write/Edit tool call. First create the file with an initial section, then append each remaining section with separate, smaller Write/Edit calls. This local model's output is token-capped; an oversized single tool call is truncated and silently dropped."
 
 CLAUDE_FLAGS=(
-    --strict-mcp-config
-    --mcp-config "$MCP_CONFIG"
     --tools "Bash,Read,Edit,Write,Glob,Grep,WebSearch,WebFetch"
     # Pre-allow the same 8 built-in tools so auto mode never makes its
     # model-based safety-classifier call (a slow, serialized local model
@@ -1311,6 +1359,28 @@ CLAUDE_FLAGS=(
     --allowedTools "Bash,Read,Edit,Write,Glob,Grep,WebSearch,WebFetch"
     --append-system-prompt "$_WRITE_IN_PARTS_GUIDANCE"
 )
+# Claude in Chrome adds ~22 browser tools (~14k tokens) to every request, and
+# --strict-mcp-config doesn't strip them — it isn't an MCP server. Off unless
+# --chrome is passed.
+if [[ "$USE_CHROME" != true ]]; then
+    CLAUDE_FLAGS+=(--no-chrome)
+fi
+# MCP servers. Off by default: every MCP tool's definition rides along in every
+# request, and a local model drowns in them (README #9). --tools above limits
+# only the built-in tools; MCP tools are governed by which servers are loaded.
+case "$MCP_MODE" in
+    all)  ;;   # --mcp: the user's usual MCP servers and plugins, as plain `claude` loads them
+    file) CLAUDE_FLAGS=(--strict-mcp-config --mcp-config "$MCP_USER_CONFIG" "${CLAUDE_FLAGS[@]}") ;;
+    *)    CLAUDE_FLAGS=(--strict-mcp-config --mcp-config "$MCP_CONFIG" "${CLAUDE_FLAGS[@]}") ;;
+esac
+# Prompt caching: vllm-mlx and most Anthropic-API boxes don't understand
+# Anthropic's cache_control markers, so Claude Code is told not to send them.
+# ccrouter's providers cache automatically on a repeated prompt prefix (the
+# markers are ignored), so leave caching on there — it also silences Claude
+# Code's "Prompt caching off" warning.
+if [[ -z "$CCROUTER_PROFILE" ]]; then
+    CLAUDE_ENV+=("DISABLE_PROMPT_CACHING=1")
+fi
 
 # --- Reasoning / thinking configuration -------------------------------------
 # Default OFF. Claude Code drives long agentic loops, and a reasoning model

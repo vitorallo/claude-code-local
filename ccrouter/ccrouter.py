@@ -46,6 +46,11 @@ LIMIT_TEXT = re.compile(r"quota|credit|rate.?limit|too many requests|exceeded|de
 # ...and the profile is treated as used up for the whole session when it matches these.
 EXHAUSTED_TEXT = re.compile(r"credit|quota|insufficient|balance|payment", re.IGNORECASE)
 DEFAULT_COOLDOWN = 60
+# Overloaded (503, "overloaded") or silent too long before the first byte:
+# also rotate, but the profile comes back sooner than after a limit.
+OVERLOAD_COOLDOWN = 30
+SLOW_COOLDOWN = 120
+DEFAULT_FIRST_TOKEN_TIMEOUT = 45
 
 
 # --------------------------------------------------------------------------
@@ -65,6 +70,7 @@ def mask(key):
 def parse_config(data):
     data = data or {}
     profiles = {}
+    skipped = []  # profiles left out because their key is still the template placeholder
     for number, raw in (data.get("profiles") or {}).items():
         try:
             n = int(number)
@@ -72,6 +78,8 @@ def parse_config(data):
             raise ConfigError(f"profile key {number!r} must be a number")
         if not isinstance(raw, dict):
             raise ConfigError(f"profile {n}: expected a mapping")
+        if raw.get("enabled", True) is False:
+            continue  # switched off (e.g. from ccroutermgmt); not validated, never used
         for field in ("base_url", "model"):
             if not raw.get(field):
                 raise ConfigError(f"profile {n}: missing {field}")
@@ -83,7 +91,8 @@ def parse_config(data):
             if not key:
                 raise ConfigError(f"profile {n}: environment variable {raw['api_key_env']} is not set")
         if key and "xxxx" in key:
-            raise ConfigError(f"profile {n}: api_key is still the placeholder — put your real key in config.yaml")
+            skipped.append(f"profile {n} ({raw.get('name') or 'unnamed'}): api_key is still the placeholder")
+            continue
         profiles[n] = {
             "num": n,
             "name": raw.get("name") or f"profile-{n}",
@@ -94,9 +103,13 @@ def parse_config(data):
             "max_output": int(raw["max_output"]) if raw.get("max_output") else None,
             "extra_body": raw.get("extra_body") or {},
             "timeout": float(raw.get("timeout") or 600),
+            "first_token_timeout": float(raw.get("first_token_timeout") or DEFAULT_FIRST_TOKEN_TIMEOUT),
+            "vision": raw.get("vision") is True,  # images are replaced by a note unless the model can read them
         }
     if not profiles:
-        raise ConfigError("no profiles defined")
+        if skipped:
+            raise ConfigError("; ".join(skipped) + " — put a real key in config.yaml, or set it with ccroutermgmt (k)")
+        raise ConfigError("no enabled profiles")
     listen = data.get("listen") or {}
     logcfg = data.get("log") or {}
     return {
@@ -107,13 +120,14 @@ def parse_config(data):
         "bodies": bool(logcfg.get("bodies", True)),
         "bodies_keep": int(logcfg.get("bodies_keep", 100)),
         "profiles": dict(sorted(profiles.items())),
+        "skipped": skipped,
     }
 
 
 def load_config(path):
     path = Path(path)
     if not path.exists():
-        raise ConfigError(f"{path} not found — cp config.example.yaml config.yaml and add your key")
+        raise ConfigError(f"{path} not found — cp config.yaml.example config.yaml and add your key")
     return parse_config(yaml.safe_load(path.read_text()))
 
 
@@ -151,11 +165,23 @@ class Router:
     def is_limit(status, text):
         return status in LIMIT_STATUS or (status in (400, 403) and bool(LIMIT_TEXT.search(text)))
 
-    def rotate(self, failed, status, text, retry_after=None):
-        """Mark `failed` as limited and return the profile to retry on, or None."""
+    @staticmethod
+    def is_overload(status, text):
+        return status in (503, 529) or "overloaded" in text.lower()
+
+    def has_alternative(self, num):
         with self.lock:
             now = time.time()
-            if status == 402 or EXHAUSTED_TEXT.search(text):
+            return any(n != num and self.cooldown_until.get(n, 0) <= now for n in self.profiles)
+
+    def rotate(self, failed, status, text, retry_after=None, cooldown=None):
+        """Mark `failed` as unavailable and return the profile to retry on, or None.
+        `cooldown` (seconds) overrides the limit rules, for overloads and slow starts."""
+        with self.lock:
+            now = time.time()
+            if cooldown is not None:
+                self.cooldown_until[failed] = now + cooldown
+            elif status == 402 or EXHAUSTED_TEXT.search(text):
                 self.cooldown_until[failed] = math.inf
             else:
                 self.cooldown_until[failed] = now + (retry_after or DEFAULT_COOLDOWN)
@@ -168,9 +194,38 @@ class Router:
                 chosen = random.choice(available)
             else:
                 chosen = min(available, key=lambda n: (n <= failed, n))  # next number up, wrapping
-            log.warning("rotate profile %d -> %d (HTTP %d: %s)", failed, chosen, status, text[:200].replace("\n", " "))
+            reason = (f"HTTP {status}: " if status else "") + text[:200].replace("\n", " ")
+            log.warning("rotate profile %d -> %d (%s)", failed, chosen, reason)
             self.active = chosen
             return self.profiles[chosen]
+
+    def update_profiles(self, profiles):
+        """Swap in a reloaded profile set; keep the active one if it's still enabled."""
+        with self.lock:
+            self.profiles = profiles
+            self.cooldown_until = {n: t for n, t in self.cooldown_until.items() if n in profiles}
+            if self.active not in profiles:
+                self.active = next(iter(profiles))
+            return self.active
+
+    def activate(self, number):
+        with self.lock:
+            if number not in self.profiles:
+                return False
+            self.active = number
+            self.cooldown_until.pop(number, None)
+            return True
+
+    def status(self):
+        with self.lock:
+            now = time.time()
+            rows = []
+            for n, p in self.profiles.items():
+                until = self.cooldown_until.get(n)
+                cooldown = None if until is None or until <= now else ("session" if math.isinf(until) else int(until - now))
+                rows.append({"num": n, "name": p["name"], "model": p["model"], "base_url": p["base_url"],
+                             "cooldown_s": cooldown})
+            return {"active": self.active, "profiles": rows}
 
     def soonest_available(self):
         with self.lock:
@@ -236,14 +291,66 @@ def stream_error_status(error):
     return code if 400 <= code < 600 else 502
 
 
+class SlowStart(Exception):
+    pass
+
+
+def open_upstream(client, profile, request, deadline=None):
+    """Send the request and, for a stream, read up to its first chunk.
+
+    Runs in a worker thread so a provider that just sits in its queue can be
+    given up on after `deadline` seconds (None = wait as long as it takes).
+    An abandoned request is closed as soon as it answers. Returns a dict with
+    response, status, and text (error body) or lines (stream iterator).
+    """
+    box, done, abandoned = {}, threading.Event(), threading.Event()
+
+    def work():
+        try:
+            try:
+                response = send_upstream(client, profile, request)
+            except (httpx.RemoteProtocolError, httpx.ReadError, httpx.WriteError) as e:
+                # NVIDIA's edge silently drops idle keep-alive sockets; retry once on a fresh one.
+                log.info("retrying %s after a dropped connection: %r", profile["name"], e)
+                response = send_upstream(client, profile, request)
+            result = {"response": response, "status": response.status_code}
+            if response.status_code >= 400:
+                result["text"] = response.read().decode(errors="replace")
+                response.close()
+            elif request.get("stream"):
+                lines, error = first_stream_chunk(response)
+                if error is not None:
+                    response.close()
+                    result.update(status=stream_error_status(error), text=json.dumps(error, ensure_ascii=False))
+                result["lines"] = lines
+            box.update(result)
+        except Exception as e:
+            box["exc"] = e
+        finally:
+            done.set()
+            if abandoned.is_set() and "response" in box:
+                box["response"].close()
+
+    threading.Thread(target=work, daemon=True).start()
+    if not done.wait(deadline):
+        abandoned.set()
+        if done.is_set() and "response" in box:  # finished in the gap
+            box["response"].close()
+        raise SlowStart(deadline)
+    if "exc" in box:
+        raise box["exc"]
+    return box
+
+
 # --------------------------------------------------------------------------
 # HTTP server
 # --------------------------------------------------------------------------
 
 class App:
-    def __init__(self, config, router):
+    def __init__(self, config, router, config_path=None):
         self.config = config
         self.router = router
+        self.config_path = config_path
         self.client = httpx.Client()
         self.write_lock = threading.Lock()
         self.bodies_dir = config["log_dir"] / "bodies"
@@ -292,6 +399,8 @@ class Handler(BaseHTTPRequestHandler):
                 "id": "ccrouter", "object": "model", "owned_by": profile["name"],
                 "upstream_model": profile["model"], "max_model_len": profile["context"],
                 "max_output_tokens": profile["max_output"] or 32000}]})
+        elif path == "/admin/status":
+            self.send_json(200, self.app.router.status())
         else:
             log.info("404 GET %s", self.path)
             self.send_json(404, tr.error_body(404, f"no route for GET {path}"))
@@ -308,6 +417,27 @@ class Handler(BaseHTTPRequestHandler):
             self.messages(body)
         elif path == "/v1/messages/count_tokens":
             self.send_json(200, {"input_tokens": tr.estimate_tokens(body)})
+        # Admin endpoints for ccroutermgmt (the server only listens on 127.0.0.1).
+        elif path == "/admin/reload":
+            if not self.app.config_path:
+                return self.send_json(400, tr.error_body(400, "router was started without a config file"))
+            try:
+                config = load_config(self.app.config_path)
+            except ConfigError as e:
+                log.warning("config reload rejected: %s", e)
+                return self.send_json(400, tr.error_body(400, str(e)))
+            active = self.app.router.update_profiles(config["profiles"])
+            log.info("config reloaded: enabled profiles %s, active %d", list(config["profiles"]), active)
+            self.send_json(200, self.app.router.status())
+        elif path == "/admin/activate":
+            try:
+                number = int(body.get("profile"))
+            except (TypeError, ValueError):
+                return self.send_json(400, tr.error_body(400, "body must be {\"profile\": N}"))
+            if not self.app.router.activate(number):
+                return self.send_json(404, tr.error_body(404, f"profile {number} is not enabled"))
+            log.info("active profile set to %d (from ccroutermgmt)", number)
+            self.send_json(200, self.app.router.status())
         else:
             log.info("404 POST %s", self.path)
             self.send_json(404, tr.error_body(404, f"no route for POST {path}"))
@@ -323,39 +453,48 @@ class Handler(BaseHTTPRequestHandler):
                  "stream": stream, "client_model": client_model, "n_messages": len(body.get("messages") or []),
                  "n_tools": len(body.get("tools") or []), "max_tokens": body.get("max_tokens"), "rotations": []}
         bodies = {"anthropic_request": body, "attempts": []}
+        self.tool_names = tr.tool_name_map(body)  # to restore MCP tool names the provider saw shortened
         profile = app.router.current()
         try:
             for _ in range(len(app.router.profiles) + 1):
                 entry.update(profile=profile["num"], profile_name=profile["name"], model=profile["model"])
-                request = tr.to_openai(body, profile["model"], profile["max_output"], profile["extra_body"])
+                request = tr.to_openai(body, profile["model"], profile["max_output"], profile["extra_body"], profile["vision"])
                 attempt = {"profile": profile["num"], "openai_request": request}
                 bodies["attempts"].append(attempt)
+                # Only give up on a slow provider when there's somewhere else to go.
+                deadline = profile["first_token_timeout"] if app.router.has_alternative(profile["num"]) else None
                 try:
-                    response = send_upstream(app.client, profile, request)
+                    got = open_upstream(app.client, profile, request, deadline)
+                except SlowStart:
+                    note = f"no response within {deadline:g}s"
+                    attempt["error"] = note
+                    log.warning("%s profile %d: %s", entry["id"], profile["num"], note)
+                    entry["rotations"].append({"from": profile["num"], "reason": "slow"})
+                    nxt = app.router.rotate(profile["num"], 0, note, cooldown=SLOW_COOLDOWN)
+                    if nxt:
+                        profile = nxt
+                        continue
+                    entry.update(status=504, error=note)
+                    return self.send_json(504, tr.error_body(504, f"ccrouter: {profile['name']}: {note}"))
                 except httpx.HTTPError as e:
                     entry.update(status=502, error=f"upstream unreachable: {e!r}")
                     log.error("%s profile %d unreachable: %r", entry["id"], profile["num"], e)
                     return self.send_json(502, tr.error_body(502, f"ccrouter: {profile['name']} unreachable: {e}"))
 
-                status, text, lines = response.status_code, None, None
-                if status >= 400:
-                    text = response.read().decode(errors="replace")
-                    response.close()
-                elif stream:
-                    lines, stream_error = first_stream_chunk(response)
-                    if stream_error is not None:
-                        response.close()
-                        status, text = stream_error_status(stream_error), json.dumps(stream_error, ensure_ascii=False)
-
+                response, status, text, lines = got["response"], got["status"], got.get("text"), got.get("lines")
                 if text is not None:
                     attempt.update(status=status, error=text)
                     log.warning("%s profile %d HTTP %d: %s", entry["id"], profile["num"], status, text[:500])
-                    if app.router.is_limit(status, text):
-                        entry["rotations"].append({"from": profile["num"], "status": status})
-                        nxt = app.router.rotate(profile["num"], status, text, retry_after_seconds(response))
+                    limit = app.router.is_limit(status, text)
+                    if limit or app.router.is_overload(status, text):
+                        entry["rotations"].append({"from": profile["num"], "status": status,
+                                                   "reason": "limit" if limit else "overloaded"})
+                        nxt = app.router.rotate(profile["num"], status, text, retry_after_seconds(response),
+                                                cooldown=None if limit else OVERLOAD_COOLDOWN)
                         if nxt:
                             profile = nxt
                             continue
+                    if limit:
                         wait = app.router.soonest_available()
                         message = f"ccrouter: every profile has hit its limit ({text[:300]})"
                         if wait is not None:
@@ -383,10 +522,11 @@ class Handler(BaseHTTPRequestHandler):
                 pass
         finally:
             entry["total_ms"] = int((time.time() - started) * 1000)
-            log.info("%s %s p%s %s stream=%s msgs=%d tools=%d -> %s stop=%s in=%s out=%s %dms%s",
+            log.info("%s %s p%s %s stream=%s msgs=%d tools=%d -> %s stop=%s in=%s cached=%s out=%s %dms%s",
                      entry["id"], "POST /v1/messages", entry.get("profile"), entry.get("model"), stream,
                      entry["n_messages"], entry["n_tools"], entry.get("status"), entry.get("stop_reason"),
-                     entry.get("input_tokens"), entry.get("output_tokens"), entry["total_ms"],
+                     entry.get("input_tokens"), entry.get("cache_read_input_tokens", 0),
+                     entry.get("output_tokens"), entry["total_ms"],
                      f" rotations={entry['rotations']}" if entry["rotations"] else "")
             app.record(entry, bodies)
 
@@ -396,12 +536,12 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             response.close()
         attempt["response"] = upstream
-        message = tr.from_openai(upstream, client_model)
+        message = tr.from_openai(upstream, client_model, self.tool_names)
         entry.update(stop_reason=message["stop_reason"], **message["usage"])
         self.send_json(200, message)
 
     def relay_stream(self, lines, response, client_model, entry, attempt):
-        translator = tr.StreamTranslator(client_model)
+        translator = tr.StreamTranslator(client_model, self.tool_names)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -453,11 +593,11 @@ class Handler(BaseHTTPRequestHandler):
                 log.warning("%s invalid JSON tool arguments from provider for %s", entry["id"], bad)
 
 
-def make_server(config, start, random_mode, host=None, port=None):
+def make_server(config, start, random_mode, host=None, port=None, config_path=None):
     router = Router(config["profiles"], start, random_mode)
     server = ThreadingHTTPServer((host or config["host"], config["port"] if port is None else port), Handler)
     server.daemon_threads = True
-    server.app = App(config, router)
+    server.app = App(config, router, config_path)
     return server
 
 
@@ -466,7 +606,8 @@ def pick_start(profiles, choice):
         return random.choice(list(profiles)), True
     n = int(choice)
     if n not in profiles:
-        raise ConfigError(f"profile {n} not in config (have: {', '.join(map(str, profiles))})")
+        raise ConfigError(f"profile {n} isn't usable — missing, disabled, or its key is still the placeholder "
+                          f"(usable: {', '.join(map(str, profiles))})")
     return n, False
 
 
@@ -478,7 +619,7 @@ def cmd_serve(args, config):
     setup_logging(config["log_dir"], config["log_level"])
     start, random_mode = pick_start(config["profiles"], args.profile)
     try:
-        server = make_server(config, start, random_mode, port=args.port)
+        server = make_server(config, start, random_mode, port=args.port, config_path=args.config)
     except OSError as e:
         log.error("cannot listen on %s:%s: %s", config["host"], args.port or config["port"], e)
         return 1
@@ -488,6 +629,8 @@ def cmd_serve(args, config):
         log.info("  profile %d  %-24s %-40s %s  %s", p["num"], p["name"], p["model"], mask(p["api_key"]), p["base_url"])
     log.info("active profile %d (%s)%s", start, config["profiles"][start]["name"],
              " — picked at random" if random_mode else "")
+    for note in config["skipped"]:
+        log.warning("skipped %s", note)
 
     def stop(*_):
         raise KeyboardInterrupt
@@ -519,69 +662,78 @@ def cmd_serve(args, config):
 def cmd_list(args, config):
     for p in config["profiles"].values():
         print(f"{p['num']:>3}  {p['name']:<26} {p['model']:<42} {mask(p['api_key']):<14} {p['base_url']}")
+    for note in config["skipped"]:
+        print(f"skipped: {note}", file=sys.stderr)
     return 0
+
+
+PROBES = [
+    ("text", {"model": "test", "max_tokens": 64, "stream": False,
+              "messages": [{"role": "user", "content": "Reply with exactly one word: pong"}]}),
+    ("tool+stream", {"model": "test", "max_tokens": 512, "stream": True,
+                     "messages": [{"role": "user", "content": "What is the weather in Rome? Use the tool."}],
+                     "tools": [{"name": "get_weather", "description": "Get the current weather for a city",
+                                "input_schema": {"type": "object", "properties": {"city": {"type": "string"}},
+                                                 "required": ["city"]}}]}),
+]
+
+
+def probe_profile(client, profile):
+    """Send a text probe and a streaming tool-call probe straight to a profile's
+    provider. Returns [(label, ok, ms, detail)]. Used by `test` and ccroutermgmt."""
+    results = []
+    for label, body in PROBES:
+        started = time.time()
+        elapsed = lambda: int((time.time() - started) * 1000)  # noqa: E731
+        request = tr.to_openai(body, profile["model"], profile["max_output"], profile["extra_body"], profile["vision"])
+        try:
+            response = send_upstream(client, profile, request)
+            if response.status_code >= 400:
+                detail = f"HTTP {response.status_code}: {response.read().decode(errors='replace')[:300]}"
+                response.close()
+                results.append((label, False, elapsed(), detail))
+                continue
+            notes = []
+            if body["stream"]:
+                translator = tr.StreamTranslator("test")
+                for line in response.iter_lines():
+                    if line.startswith("data:") and line[5:].strip() != "[DONE]":
+                        chunk = json.loads(line[5:])
+                        if chunk.get("error"):
+                            notes.append(f"error chunk: {chunk['error']}")
+                        translator.feed(chunk)
+                translator.close()
+                message = translator.message()
+            else:
+                message = tr.from_openai(json.loads(response.read()), "test")
+            response.close()
+        except (httpx.HTTPError, ValueError) as e:
+            results.append((label, False, elapsed(), f"{type(e).__name__}: {e}"))
+            continue
+        tools = [b for b in message["content"] if b["type"] == "tool_use"]
+        text = "".join(b.get("text", "") for b in message["content"] if b["type"] == "text").strip()
+        ok = bool(tools and tools[0]["input"].get("city")) if label.startswith("tool") else bool(text)
+        shown = f"tool_use {tools[0]['name']}({json.dumps(tools[0]['input'])})" if tools else repr(text[:80])
+        detail = f"stop={message['stop_reason']}  usage={message['usage']}  {shown}"
+        if notes:
+            detail += f"  ({'; '.join(notes)[:200]})"
+        results.append((label, ok, elapsed(), detail))
+    return results
 
 
 def cmd_test(args, config):
     numbers = [int(args.number)] if args.number else list(config["profiles"])
-    client = httpx.Client()
     failures = 0
-    probes = [
-        ("text", {"model": "test", "max_tokens": 64, "stream": False,
-                  "messages": [{"role": "user", "content": "Reply with exactly one word: pong"}]}),
-        ("tool+stream", {"model": "test", "max_tokens": 512, "stream": True,
-                         "messages": [{"role": "user", "content": "What is the weather in Rome? Use the tool."}],
-                         "tools": [{"name": "get_weather", "description": "Get the current weather for a city",
-                                    "input_schema": {"type": "object", "properties": {"city": {"type": "string"}},
-                                                     "required": ["city"]}}]}),
-    ]
-    for n in numbers:
-        profile = config["profiles"].get(n)
-        if not profile:
-            print(f"profile {n}: not in config")
-            return 2
-        print(f"profile {n} — {profile['name']} ({profile['model']})")
-        for label, body in probes:
-            started = time.time()
-            request = tr.to_openai(body, profile["model"], profile["max_output"], profile["extra_body"])
-            try:
-                response = send_upstream(client, profile, request)
-            except httpx.HTTPError as e:
-                print(f"  {label:<12} FAIL  unreachable: {e}")
-                failures += 1
-                continue
-            if response.status_code >= 400:
-                print(f"  {label:<12} FAIL  HTTP {response.status_code}: {response.read().decode(errors='replace')[:300]}")
-                response.close()
-                failures += 1
-                continue
-            if body["stream"]:
-                translator = tr.StreamTranslator("test")
-                chunks, other = 0, []
-                for line in response.iter_lines():
-                    if line.startswith("data:") and line[5:].strip() != "[DONE]":
-                        chunk = json.loads(line[5:])
-                        chunks += 1
-                        if chunk.get("error"):
-                            other.append(f"error chunk: {chunk['error']}")
-                        translator.feed(chunk)
-                    elif line.strip() and not line.startswith("data:"):
-                        other.append(line[:200])
-                translator.close()
-                message = translator.message()
-                if not chunks or other:
-                    print(f"  {label:<12} note  {chunks} data chunks; other lines: {other[:3]}")
-            else:
-                message = tr.from_openai(json.loads(response.read()), "test")
-            response.close()
-            ms = int((time.time() - started) * 1000)
-            tools = [b for b in message["content"] if b["type"] == "tool_use"]
-            text = "".join(b.get("text", "") for b in message["content"] if b["type"] == "text").strip()
-            ok = (tools and tools[0]["input"].get("city")) if label.startswith("tool") else bool(text)
-            failures += 0 if ok else 1
-            shown = f"tool_use {tools[0]['name']}({json.dumps(tools[0]['input'])})" if tools else repr(text[:80])
-            print(f"  {label:<12} {'ok  ' if ok else 'FAIL'}  {ms}ms  stop={message['stop_reason']}  "
-                  f"usage={message['usage']}  {shown}")
+    with httpx.Client() as client:
+        for n in numbers:
+            profile = config["profiles"].get(n)
+            if not profile:
+                print(f"profile {n}: not in config or disabled")
+                return 2
+            print(f"profile {n} — {profile['name']} ({profile['model']})")
+            for label, ok, ms, detail in probe_profile(client, profile):
+                failures += 0 if ok else 1
+                print(f"  {label:<12} {'ok  ' if ok else 'FAIL'}  {ms}ms  {detail}")
     return 1 if failures else 0
 
 

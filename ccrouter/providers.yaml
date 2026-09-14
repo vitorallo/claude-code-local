@@ -1,0 +1,210 @@
+# Provider catalog for ccroutermgmt's "Add provider" tab.
+#
+# Only providers with an OpenAI-compatible /v1/chat/completions endpoint are
+# listed — that's all ccrouter speaks. Sourced from OmniRoute's free-model
+# catalog and provider registry (2026-09), plus our own probes where noted.
+#
+#   auth:  key   — needs an API key (key_url says where to get one)
+#          none  — no registration, no key
+#          any   — needs *some* key string, any value works
+#   tos:   ok | caution | avoid   (OmniRoute's terms-of-use rating)
+#
+# Free tiers and model lineups change often. `Fetch models` in ccroutermgmt
+# asks the provider for its live list, and `t` on a profile tests text + tool
+# calling — Claude Code is useless without tool calling.
+
+providers:
+  - id: nvidia
+    name: NVIDIA build.nvidia.com
+    base_url: https://integrate.api.nvidia.com/v1
+    auth: key
+    key_url: https://build.nvidia.com/settings/api-keys
+    free: free developer program, ~40 requests/min, no card
+    tos: caution
+    context: 1000000
+    max_output: 16384
+    extra_body:
+      chat_template_kwargs: {enable_thinking: false, force_nonempty_content: true}
+    notes: >-
+      Probed 2026-09-14: nemotron-3-super answers in ~0.5s (tool call ~1.2s);
+      nemotron-3-ultra queues ~65s per request on the free tier and sometimes
+      answers 503 overloaded; nemotron-3.5-lightning ~20-30s.
+    models:
+      - nvidia/nemotron-3-super-120b-a12b
+      - nvidia/nemotron-3-ultra-550b-a55b
+      - nvidia/nemotron-3.5-lightning-30b-a3b
+      - moonshotai/kimi-k3
+      - google/gemma-4-31b-it
+
+  - id: groq
+    name: Groq
+    base_url: https://api.groq.com/openai/v1
+    auth: key
+    key_url: https://console.groq.com/keys
+    free: daily — ~200K tokens/day per model, no card
+    tos: caution
+    context: 131072
+    notes: Very fast inference. Hard 429 at the daily cap.
+    models:
+      - openai/gpt-oss-120b
+      - qwen/qwen3.8-27b
+
+  - id: mistral
+    name: Mistral (La Plateforme)
+    base_url: https://api.mistral.ai/v1
+    auth: key
+    key_url: https://console.mistral.ai/api-keys
+    free: monthly — free tier, ~1B tokens/month
+    tos: caution
+    context: 128000
+    notes: >-
+      Devstral and Codestral are coding-tuned. Free "Experiment" plan: phone
+      verification, no card; choose the plan under Billing before the key works;
+      ~1 request/s; the free plan opts you into data training. Probed 2026-09-14:
+      codestral-latest text ~0.3s, tool call ~2.1s.
+    models:
+      - devstral-latest
+      - codestral-latest
+      - mistral-medium-3-5
+
+  - id: openrouter
+    name: OpenRouter (:free models)
+    base_url: https://openrouter.ai/api/v1
+    auth: key
+    key_url: https://openrouter.ai/settings/keys
+    free: daily — 20 requests/min, 200 requests/day on :free models
+    tos: caution
+    context: 262144
+    models:
+      - nvidia/nemotron-3-ultra-550b-a55b:free
+      - nvidia/nemotron-3-super-120b-a12b:free
+
+  - id: ollama-cloud
+    name: Ollama Cloud
+    base_url: https://ollama.com/v1
+    auth: key
+    key_url: https://ollama.com/settings/keys
+    free: light usage, uncapped
+    tos: caution
+    context: 131072
+    models:
+      - deepseek-v4-flash
+      - kimi-k2.6
+      - glm-5.1
+
+  - id: requesty
+    name: Requesty
+    base_url: https://router.requesty.ai/v1
+    auth: key
+    key_url: https://app.requesty.ai/api-keys
+    free: ~200 requests/day
+    tos: ok
+    context: 131072
+    models:
+      - openai/gpt-oss-120b
+
+  - id: siliconflow
+    name: SiliconFlow
+    base_url: https://api.siliconflow.com/v1
+    auth: key
+    key_url: https://cloud.siliconflow.com/account/ak
+    free: $0 models after ID verification
+    tos: caution
+    context: 262144
+    models:
+      - Qwen/Qwen3-Coder-480B-A35B-Instruct
+      - moonshotai/Kimi-K2.5
+
+  - id: glm-cn
+    name: Zhipu BigModel (GLM flash)
+    base_url: https://open.bigmodel.cn/api/coding/paas/v4
+    auth: key
+    key_url: https://open.bigmodel.cn/usercenter/apikeys
+    free: flash models are free
+    tos: ok
+    context: 128000
+    models:
+      - glm-4.7-flash
+      - glm-4.5-flash
+
+  # --- No registration / no key --------------------------------------------
+
+  - id: ovhcloud
+    name: OVHcloud AI Endpoints (anonymous)
+    base_url: https://oai.endpoints.kepler.ai.cloud.ovh.net/v1
+    auth: none
+    key_url: https://www.ovhcloud.com/en/public-cloud/ai-endpoints/
+    free: keyless — 2 requests/min per IP per model (400/min with a key)
+    tos: ok
+    context: 128000
+    notes: >-
+      Probed 2026-09-14: anonymous tier answered 429 "API rate limit exceeded"
+      after a couple of requests. Too tight for Claude Code alone; fine as a
+      last-resort rotation target. A wrong key is worse than none (403).
+    models:
+      - gpt-oss-120b
+      - Qwen3.6-27B
+
+  - id: kilo-gateway
+    name: Kilo Gateway (free models)
+    base_url: https://api.kilo.ai/api/gateway
+    auth: none
+    key_url: https://app.kilo.ai
+    free: keyless, uncapped
+    tos: caution
+    notes: The free models TRAIN ON YOUR PROMPTS. Don't send private code.
+    context: 131072
+    models:
+      - kilo-auto/free
+      - kwaipilot/kat-coder-pro-v2.5:free
+      - nvidia/nemotron-3-ultra-550b-a55b:free
+
+  - id: opencode-zen
+    name: OpenCode Zen (free models)
+    base_url: https://opencode.ai/zen/v1
+    auth: none
+    key_url: https://opencode.ai/auth
+    free: keyless, uncapped; free lineup rotates
+    tos: avoid
+    context: 131072
+    models:
+      - deepseek-v4-flash-free
+      - nemotron-3-ultra-free
+
+  - id: uncloseai
+    name: uncloseai (Hermes)
+    base_url: https://hermes.ai.unturf.com/v1
+    auth: any
+    free: keyless
+    tos: caution
+    context: 32768
+    notes: >-
+      Model ids change — use Fetch models. Probed 2026-09-14: the catalog's
+      qwen3.6:27b returned 404.
+    models: []
+
+  - id: llm7
+    name: LLM7
+    base_url: https://api.llm7.io/v1
+    auth: any
+    free: daily, any key string works
+    tos: caution
+    context: 32768
+    models:
+      - qwen2.5-coder-32b-instruct
+      - deepseek-r1-0528
+
+  - id: pollinations
+    name: Pollinations
+    base_url: https://gen.pollinations.ai/v1
+    auth: key
+    key_url: https://enter.pollinations.ai/keys
+    free: free key
+    tos: caution
+    context: 128000
+    notes: >-
+      Listed as keyless by OmniRoute, but probed 2026-09-14 it returned 401
+      "A valid API key is required".
+    models:
+      - qwen-coder
+      - openai-large

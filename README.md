@@ -29,6 +29,11 @@ No API key. No cloud. No subscription. No data leaves your machine. Just `./inst
 
 ## What you need
 
+> **No Anthropic account or Claude subscription needed.** `cclocal` gives Claude Code a dummy credential and points
+> it at your own model server (or ccrouter), so Claude Code never asks you to log in. Verified on 2026-09-14 with a
+> brand-new, empty Claude Code config: the first start shows a theme picker, security notes and a folder-trust check
+> — which pre-selects **No, exit**, so pick **Yes, I trust this folder** — and then works.
+
 - Apple Silicon Mac (M1/M2/M3/M4/M5)
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) installed
 - [Homebrew](https://brew.sh)
@@ -472,7 +477,7 @@ Then point Claude Code at it:
 ```bash
 env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN \
   ANTHROPIC_BASE_URL=http://127.0.0.1:8000 \
-  ANTHROPIC_API_KEY=not-needed \
+  ANTHROPIC_AUTH_TOKEN=not-needed \
   ANTHROPIC_MODEL=mlx-community/Qwen3.8-27B-4bit \
   ANTHROPIC_DEFAULT_OPUS_MODEL=mlx-community/Qwen3.8-27B-4bit \
   ANTHROPIC_DEFAULT_SONNET_MODEL=mlx-community/Qwen3.8-27B-4bit \
@@ -482,7 +487,7 @@ env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN \
   CLAUDE_CODE_ATTRIBUTION_HEADER=0 \
   DISABLE_PROMPT_CACHING=1 DISABLE_AUTOUPDATER=1 DISABLE_TELEMETRY=1 \
   DISABLE_ERROR_REPORTING=1 DISABLE_NON_ESSENTIAL_MODEL_CALLS=1 \
-  claude --strict-mcp-config --mcp-config mcp-local.json \
+  claude --strict-mcp-config --mcp-config mcp-local.json --no-chrome \
     --tools "Bash,Read,Edit,Write,Glob,Grep,WebSearch,WebFetch" \
     --allowedTools "Bash,Read,Edit,Write,Glob,Grep,WebSearch,WebFetch"
 ```
@@ -537,6 +542,8 @@ cclocal --qwen38 --out-tokens 16384  # Bigger output budget for large file write
 cclocal --qwen38 --safe              # Force the memory-safeguard menu (raise GPU limit / shrink ctx)
 cclocal --qwen38 --no-mem-check      # Skip the GPU-headroom preflight prompt
 cclocal --qwen38 --think             # Enable brief reasoning (reasoning_effort=low)
+cclocal --ccrouter --mcp             # Also load your MCP servers and plugins (Playwright, Context7, ...)
+cclocal --ccrouter --mcp-config mcp-playwright.json   # Load only the servers in that file
 
 # Remote backend — run the model on another box, not this Mac
 cclocal --lmstudio                   # LM Studio's server on this Mac (needs 0.4.1+)
@@ -546,7 +553,8 @@ cclocal --api 192.168.1.50           # Any Anthropic-API box on your LAN (port 8
 cclocal --remote http://host:8000    # Any remote vLLM endpoint (model auto-detected)
 
 # Hosted providers (NVIDIA Nemotron free tier, Groq, OpenRouter...) via ccrouter
-cclocal --ccrouter                   # Profile 1 from ccrouter/config.yaml
+cclocal --ccrouter                   # Choose a profile from ccrouter/config.yaml in a menu
+cclocal --ccrouter 1                 # Straight to profile 1
 cclocal --ccrouter R                 # Random profile; rotates when one hits its limit
 ```
 
@@ -598,9 +606,9 @@ Then connect Claude Code from any terminal:
 
 ```bash
 ANTHROPIC_BASE_URL=http://127.0.0.1:8000 \
-ANTHROPIC_API_KEY=not-needed \
+ANTHROPIC_AUTH_TOKEN=not-needed \
 ANTHROPIC_MODEL=mlx-community/gemma-4-e4b-it-4bit \
-claude --strict-mcp-config --mcp-config /path/to/claude-code-local/mcp-local.json \
+claude --strict-mcp-config --mcp-config /path/to/claude-code-local/mcp-local.json --no-chrome \
   --tools "Bash,Read,Edit,Write,Glob,Grep,WebSearch,WebFetch"
 ```
 
@@ -701,12 +709,18 @@ speak OpenAI `/v1/chat/completions`, not Anthropic `/v1/messages`.
 it for the length of the session.
 
 ```bash
-cp ccrouter/config.example.yaml ccrouter/config.yaml && chmod 600 ccrouter/config.yaml
-# put your key(s) in it, then:
-cclocal --ccrouter          # profile 1
+ccroutermgmt                # paste your key(s): Profiles tab → k, then t to test
+cclocal --ccrouter          # pick a profile from a menu
 cclocal --ccrouter 2        # profile 2
 cclocal --ccrouter R        # random profile
 ```
+
+A fresh install's `ccrouter/config.yaml` already holds two profiles waiting for
+keys: **Nemotron 3 Super** on NVIDIA (free key at build.nvidia.com) and
+**Codestral** on Mistral (free "Experiment" plan at console.mistral.ai).
+`ccroutermgmt` doesn't need the router running — without it, it's simply a
+settings editor — and the file can just as well be edited by hand. Full
+reference, every option and a quick start: [ccrouter/README.md](ccrouter/README.md).
 
 - **Numbered profiles**, each one provider + key + model, in the gitignored
   `ccrouter/config.yaml`. Keyless providers work too.
@@ -715,10 +729,17 @@ cclocal --ccrouter R        # random profile
   request — Claude Code doesn't see it.
 - **Everything is logged** in `ccrouter/logs/`: a human log, one JSON line per
   request, and the full request/response bodies. Keys are never written.
+- **Fails over, not just on limits**: an overloaded provider (503) or one that
+  sends nothing within `first_token_timeout` also moves the request to the next
+  enabled profile.
+- **`ccroutermgmt`** is a full-screen manager: add providers from a catalog of
+  14 (keyed and keyless), set keys, switch profiles on/off or make one active
+  in the running router, test them, and watch the router's log live.
 - It plugs into the remote path above: the launcher reads the profile's context
   window and output cap from the router's `/v1/models`.
-- Expect the NVIDIA free tier to be slow when busy (45–110 s per request
-  observed) and capped around 40 requests/minute.
+- Pick the model for speed: on NVIDIA's free tier Nemotron 3 **Super** answered
+  in ~0.5 s while **Ultra** queued ~65 s per request (2026-09-14), so the
+  example config puts Super first. Free tier is ~40 requests/minute.
 
 Details, rotation rules, troubleshooting and a list of keyless providers:
 [ccrouter/README.md](ccrouter/README.md).
@@ -874,11 +895,51 @@ switch with it: Qwen publishes different recommendations per mode
 
 **Problem**: Claude Code sends ALL tool definitions in every request. With plugins enabled, that's 200+ tools crammed into the system prompt. Even 30B models choke.
 
-**Solution**: Two flags strip tools down to essentials:
+**Solution**: Three flags strip tools down to essentials:
 ```
 --strict-mcp-config --mcp-config mcp-local.json    # strips all plugin/MCP tools
+--no-chrome                                        # strips Claude in Chrome's ~22 browser tools
 --tools "Bash,Read,Edit,Write,Glob,Grep,WebSearch,WebFetch"  # 8 built-in tools only
 ```
+
+`--no-chrome` is needed separately: Claude in Chrome isn't an MCP server, so
+`--strict-mcp-config` leaves its tools in. A ccrouter session log showed 30 tools
+(8 + 22 `mcp__claude-in-chrome__*`), about 14k extra tokens on every request.
+`cclocal --chrome` keeps them if you want the browser tools.
+
+**Want MCP tools anyway?** The side effect of this fix is that a model asked to
+"use Playwright" answers that it has no such capability — it's never offered the
+tools. Two opt-in flags bring them back:
+
+```bash
+cclocal --ccrouter --mcp                                  # your usual MCP servers and plugins
+cclocal --ccrouter --mcp-config mcp-playwright.json       # only the servers in that file
+```
+
+`--mcp` drops `--strict-mcp-config` and loads whatever plain `claude` would
+(`claude mcp list` shows it); claude.ai connectors such as Gmail stay off because
+cclocal sets an API key. `--mcp-config FILE` keeps the strict mode but loads that
+file instead of the empty one — `mcp-playwright.json` in the repo is a one-server
+example. `--tools` still limits only the built-in tools; MCP tools ask for
+permission the first time they run.
+
+Limits worth knowing before turning it on:
+
+- **Context and quota.** Every tool definition is re-sent with every request —
+  Playwright alone is ~20 tools. That costs latency, eats free-tier token quotas
+  (Groq's daily token cap, for instance), and pushes a 32K local context toward
+  auto-compact. Prefer `--mcp-config` with just the server you need.
+- **Small models pick tools badly.** The 4–9B local models struggle past a
+  handful of tools; hosted models (ccrouter, a GPU server) cope much better.
+- **Provider limits (ccrouter).** OpenAI-style APIs cap tool names at 64
+  characters (letters, digits, `_`, `-`); ccrouter shortens longer MCP names and
+  maps them back, so that one is handled. Some providers also cap how many tools
+  a request may carry or reject unusual JSON-schema constructs (see #31) — a 400
+  in `ccrouter/logs/ccrouter.log` right after enabling `--mcp` is the sign.
+- **Images.** Screenshot tools return images, and most free models are text-only.
+  ccrouter replaces images with a short note unless the profile says
+  `vision: true`; ask for Playwright's `browser_snapshot` (a text page tree)
+  instead of a screenshot.
 
 Your plugins remain available when running Claude Code normally with the cloud API.
 
@@ -886,7 +947,7 @@ Your plugins remain available when running Claude Code normally with the cloud A
 
 **Problem**: Your real `ANTHROPIC_API_KEY` (`sk-ant-...`) is set in the shell. Claude Code detects it and may send it to the local server.
 
-**Solution**: `env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN` in `run.sh` explicitly unsets real keys before setting the dummy one.
+**Solution**: `env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN` in `run.sh` explicitly unsets real keys before setting the dummy one. The dummy goes in `ANTHROPIC_AUTH_TOKEN`, not `ANTHROPIC_API_KEY`: on a fresh install an API key makes Claude Code ask "Detected a custom API key in your environment — use it?" with **No** pre-selected, and No drops a new user onto the Anthropic login screen. With a token there is no question and no login.
 
 ### 11. Autoupdater and telemetry (network-dependent startup)
 
@@ -1707,7 +1768,8 @@ Every entry in the table below was first diagnosed that way.
 | `--lmstudio`: `messages.1.role: Invalid discriminator value` | LM Studio validates the Anthropic schema strictly; Claude Code puts a system message in `messages[]` | Not fixable here — use the local vllm-mlx path, see [#19](#19-system-message-must-be-at-the-beginning-opaque-http-500) |
 | "not a model this version of Claude Code recognizes… 200k tokens" | Claude Code doesn't know local model IDs | Harmless warning; `run.sh` already pins `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to the real window — see [#20](#20-claude-code-assumes-a-200k-context-window) |
 | Model seems to forget the start of a long session | Session exceeded `--max-kv-size`; oldest tokens evicted | Raise `--max-kv-size` (and the GPU limit), or start a fresh session — see [#20](#20-claude-code-assumes-a-200k-context-window) |
-| Claude Code asks about "detected custom API key" | Real API key leaking | Use `cclocal` which unsets real keys |
+| Claude Code asks about "detected custom API key" | `ANTHROPIC_API_KEY` is set — a real key leaking, or an older cclocal. Its default answer (No) leads to the Anthropic login screen | Use a current `cclocal`, which unsets real keys and passes a dummy `ANTHROPIC_AUTH_TOKEN` (no question). If you do see it, answer **Yes** |
+| A fresh install closes right after "Quick safety check: Is this a project you created or one you trust?" | That screen pre-selects **No, exit** | Start again and pick **Yes, I trust this folder** (↓ then Enter) |
 | "Model does not exist" (404) | Wrong model name | Must use full HuggingFace ID, not "default" |
 | `EngineBusy: serialized route is busy` → API error | Concurrent requests rejected instead of queued | Re-run `./install.sh`; `run.sh` now sets `VLLM_MLX_SIMPLE_ENGINE_LOCK_ADMISSION=wait` — see [#21](#21-concurrent-requests-rejected-mid-session-api-error) |
 | `System KV cache SKIP … (['top_k', 'presence_penalty'])` | Sampling flags disable the prefix cache; system prompt re-prefilled every turn | Don't set `top_k`/`min_p`/`presence_penalty`/`repetition_penalty` — see [#22](#22-sampling-flags-silently-disable-the-system-prompt-cache) |
@@ -1726,14 +1788,14 @@ Every entry in the table below was first diagnosed that way.
 | Variable | Value | Purpose |
 |----------|-------|---------|
 | `ANTHROPIC_BASE_URL` | `http://127.0.0.1:8000` (local) or the remote URL with `--remote`/`--dgx-*` | Point Claude Code at the server |
-| `ANTHROPIC_API_KEY` | `not-needed` | Dummy key (real key explicitly unset) |
+| `ANTHROPIC_AUTH_TOKEN` | `not-needed` | Dummy credential, so no Anthropic account or login is needed (real keys explicitly unset). A token rather than `ANTHROPIC_API_KEY`, which would trigger the "Detected a custom API key" question on a fresh install |
 | `ANTHROPIC_MODEL` | Full HuggingFace ID | Model identifier |
 | `ANTHROPIC_DEFAULT_*_MODEL` | Same as above | Route all tiers (Opus/Sonnet/Haiku) locally |
 | `CLAUDE_CODE_SUBAGENT_MODEL` | Same as above | Route subagent calls locally |
 | `CLAUDE_CODE_MAX_OUTPUT_TOKENS` | `8192` local / `32000` remote (≤ ¼ of the remote window), `--out-tokens N` to override | Output cap; must fit a whole Write/Edit file body (see #18) |
 | `CLAUDE_CODE_MAX_CONTEXT_TOKENS` | 85% of `--max-kv-size` (local runs only) | The window Claude Code assumes, so auto-compact fires — with headroom to run — before the KV cache evicts (see #20) |
 | `CLAUDE_CODE_ATTRIBUTION_HEADER` | `0` | Prevents KV cache invalidation |
-| `DISABLE_PROMPT_CACHING` | `1` | Local server doesn't support Anthropic caching |
+| `DISABLE_PROMPT_CACHING` | `1` (not set with `--ccrouter`) | Local server doesn't support Anthropic caching. ccrouter's providers cache automatically on a repeated prompt prefix, so it stays on there |
 | `DISABLE_AUTOUPDATER` | `1` | No update checks |
 | `DISABLE_TELEMETRY` | `1` | No telemetry |
 | `DISABLE_ERROR_REPORTING` | `1` | No error reporting |
@@ -1770,15 +1832,19 @@ Every entry in the table below was first diagnosed that way.
 | `--effort LEVEL` | Effort Claude Code asks for: `low` (default), `medium` (with `--think`), `xhigh`, or `unset` to send nothing (see [#32](#32-400-unexpected-reasoning-effort-high)) |
 | `--lmstudio` | Point at LM Studio's server on this Mac instead of running vllm-mlx (see [Remote backend](#remote-backend-dgx-spark-or-any-vllm-box)) |
 | `--api HOST[:PORT]` | Point at any box serving the Anthropic Messages API; port defaults to 8080 (see [Remote backend](#remote-backend-dgx-spark-or-any-vllm-box)) |
-| `--ccrouter [N\|R]` | Start ccrouter on port 8787 with profile N (default 1) or a random one, and use hosted OpenAI-compatible providers (see [ccrouter](#hosted-providers-via-ccrouter-nvidia-nemotron-groq-openrouter)) |
+| `--chrome` | Keep the Claude in Chrome browser tools (off by default; they add ~22 tools to every request — see #9) |
+| `--mcp` | Load your usual MCP servers and plugins (Playwright, Context7, ...) instead of none — see #9 for the costs and provider limits |
+| `--mcp-config FILE` | Load only the MCP servers in FILE (e.g. `mcp-playwright.json`) |
+| `--ccrouter [N\|R]` | Start ccrouter on port 8787 with profile N, a random one (R), or one chosen from a menu (no value), and use hosted OpenAI-compatible providers (see [ccrouter](#hosted-providers-via-ccrouter-nvidia-nemotron-groq-openrouter)) |
 | `iogpu.wired_limit_mb` | Optionally raised via `sudo sysctl` by preflight option 2; **per-session only** — reverted on exit (prompts for sudo at shutdown if creds expired), and resets on reboot |
 
 ### Claude Code flags (set by run.sh)
 
 | Flag | Purpose |
 |------|---------|
-| `--strict-mcp-config` | Ignore global plugins |
-| `--mcp-config mcp-local.json` | Empty config — no plugin tools |
+| `--strict-mcp-config` | Ignore global plugins (dropped with `cclocal --mcp`) |
+| `--mcp-config mcp-local.json` | Empty config — no plugin tools (`cclocal --mcp-config FILE` swaps in FILE) |
+| `--no-chrome` | Drop Claude in Chrome's browser tools, which `--strict-mcp-config` doesn't remove (omitted with `cclocal --chrome`; see #9) |
 | `--tools "Bash,Read,..."` | 8 essential built-in tools only |
 | `--allowedTools "Bash,Read,..."` | Pre-approve the same 8 tools so auto mode skips the slow per-action safety-classifier call (see #18) |
 | `--append-system-prompt "..."` | Tells the model to build files >~150 lines in incremental Write/Edit calls, pre-empting output-token truncation (see #18) |
@@ -1792,10 +1858,11 @@ claude-code-local/
   run.sh                    # Launcher — model catalog, memory preflight, starts vllm-mlx + Claude Code
   install.sh                # Setup — creates .venv, installs the vllm-mlx fork, symlinks cclocal
   mcp-local.json            # Empty MCP config (strips plugins for local sessions)
+  mcp-playwright.json       # One-server example for --mcp-config (Playwright)
   ccrouter/                 # Router to hosted OpenAI-compatible providers (--ccrouter)
     ccrouter.py             #   CLI + server + profile rotation + logging
     translate.py            #   Anthropic <-> OpenAI translation (pure functions)
-    config.example.yaml     #   Copy to config.yaml (gitignored) and add keys
+    config.yaml.example     #   Copy to config.yaml (gitignored) and add keys
     README.md PRD.md PLAN.md
     tests/                  #   unittest: translation + rotation against a fake upstream
     logs/                   #   ccrouter.log, requests.jsonl, bodies/ (gitignored)

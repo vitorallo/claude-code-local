@@ -14,3 +14,5 @@ narration.md
 ccrouter/config.yaml
 ccrouter/logs/
 __pycache__/
+ccrouter/config.yaml.bak
+ccrouter/config.yaml.tmp

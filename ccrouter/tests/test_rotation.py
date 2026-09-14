@@ -11,6 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import httpx
+import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -27,6 +28,8 @@ class FakeUpstream(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         self.server.seen.append((self.path, self.headers.get("Authorization"), body))
+        if self.path.startswith("/slow"):
+            time.sleep(1.5)  # then answers normally
         if self.path.startswith("/limited"):
             data = b'{"error": {"message": "Rate limit exceeded"}}'
             self.send_response(429)
@@ -79,12 +82,12 @@ class RotationTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.upstream.shutdown()
 
-    def start_router(self, paths, start=1):
+    def start_router(self, paths, start=1, extra=None):
         self.tmp = tempfile.TemporaryDirectory()
         config = ccrouter.parse_config({
             "log": {"dir": self.tmp.name, "bodies": True, "bodies_keep": 2},
             "profiles": {i + 1: {"name": f"p{i + 1}", "base_url": f"{self.upstream_url}/{p}/v1",
-                                 "model": f"model-{i + 1}", "api_key": f"key-{i + 1}-secretvalue"}
+                                 "model": f"model-{i + 1}", "api_key": f"key-{i + 1}-secretvalue", **(extra or {})}
                          for i, p in enumerate(paths)}})
         self.router_server = ccrouter.make_server(config, start, False, host="127.0.0.1", port=0)
         self.url = serve(self.router_server)
@@ -148,12 +151,49 @@ class RotationTests(unittest.TestCase):
         self.assertEqual(resp.json()["type"], "error")
         self.assertEqual(self.router_server.app.router.active, 1)
 
-    def test_error_as_first_stream_chunk_becomes_a_real_http_error(self):
+    def test_overloaded_first_chunk_rotates(self):
         self.start_router(["overloaded", "ok"])
+        resp = self.post(stream=True)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self.router_server.app.router.active, 2)
+        self.assertEqual(self.requests_log()[-1]["rotations"][0]["reason"], "overloaded")
+
+    def test_overloaded_with_nowhere_to_go_is_a_real_http_error(self):
+        self.start_router(["overloaded"])
         resp = self.post(stream=True)
         self.assertEqual(resp.status_code, 503)
         self.assertEqual(resp.json()["type"], "error")
-        self.assertEqual(self.router_server.app.router.active, 1)  # overload isn't a limit: no rotation
+
+    def test_slow_start_rotates_when_another_profile_exists(self):
+        self.start_router(["slow", "ok"], extra={"first_token_timeout": 0.5})
+        started = time.time()
+        resp = self.post(stream=True)
+        self.assertEqual(resp.status_code, 200)
+        self.assertLess(time.time() - started, 1.4)  # didn't wait out the 1.5s upstream
+        self.assertEqual(self.router_server.app.router.active, 2)
+        self.assertEqual(self.requests_log()[-1]["rotations"][0]["reason"], "slow")
+
+    def test_slow_start_waits_when_there_is_no_alternative(self):
+        self.start_router(["slow"], extra={"first_token_timeout": 0.5})
+        resp = self.post(stream=True)
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("event: message_stop", resp.text)
+
+    def test_admin_status_activate_and_reload(self):
+        self.start_router(["ok", "ok"])
+        self.assertEqual(httpx.get(self.url + "/admin/status").json()["active"], 1)
+        self.assertEqual(httpx.post(self.url + "/admin/activate", json={"profile": 2}).json()["active"], 2)
+        self.assertEqual(httpx.post(self.url + "/admin/activate", json={"profile": 9}).status_code, 404)
+        path = self.logdir / "config.yaml"
+        path.write_text(yaml.safe_dump({"profiles": {
+            1: {"base_url": f"{self.upstream_url}/ok/v1", "model": "m1"},
+            2: {"enabled": False, "base_url": "https://x/v1", "model": "m2"}}}))
+        self.router_server.app.config_path = path
+        status = httpx.post(self.url + "/admin/reload").json()
+        self.assertEqual((status["active"], [p["num"] for p in status["profiles"]]), (1, [1]))
+        path.write_text(yaml.safe_dump({"profiles": {1: {"enabled": False, "base_url": "https://x/v1", "model": "m"}}}))
+        self.assertEqual(httpx.post(self.url + "/admin/reload").status_code, 400)  # keeps the old set
+        self.assertEqual(httpx.get(self.url + "/admin/status").json()["active"], 1)
 
     def test_logs_never_contain_keys_and_bodies_are_pruned(self):
         self.start_router(["ok"])
@@ -170,6 +210,21 @@ class ConfigTests(unittest.TestCase):
     def test_placeholder_key_rejected(self):
         with self.assertRaises(ccrouter.ConfigError):
             ccrouter.parse_config({"profiles": {1: {"base_url": "https://x/v1", "model": "m", "api_key": "nvapi-xxxx"}}})
+
+    def test_placeholder_profile_skipped_when_others_are_usable(self):
+        config = ccrouter.parse_config({"profiles": {
+            1: {"name": "nv", "base_url": "https://x/v1", "model": "m", "api_key": "nvapi-xxxx"},
+            2: {"base_url": "https://y/v1", "model": "m2", "api_key": "real-key-123456"}}})
+        self.assertEqual(list(config["profiles"]), [2])
+        self.assertIn("placeholder", config["skipped"][0])
+
+    def test_disabled_profiles_are_skipped_without_validation(self):
+        config = ccrouter.parse_config({"profiles": {
+            1: {"enabled": False, "base_url": "https://x/v1", "model": "m", "api_key": "nvapi-xxxx"},
+            2: {"base_url": "https://y/v1", "model": "m2"}}})
+        self.assertEqual(list(config["profiles"]), [2])
+        with self.assertRaises(ccrouter.ConfigError):
+            ccrouter.parse_config({"profiles": {1: {"enabled": False, "base_url": "https://x/v1", "model": "m"}}})
 
     def test_keyless_profile_allowed_and_pick_start(self):
         config = ccrouter.parse_config({"profiles": {2: {"base_url": "https://x/v1", "model": "m"}}})

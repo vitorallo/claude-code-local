@@ -1,2 +1,3 @@
 httpx>=0.27
 PyYAML>=6.0
+textual>=0.80   # ccroutermgmt TUI only; the router itself doesn't import it

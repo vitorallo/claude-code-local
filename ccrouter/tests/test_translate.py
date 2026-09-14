@@ -16,14 +16,45 @@ class RequestTests(unittest.TestCase):
         self.assertEqual(msgs[0], {"role": "system", "content": "You are helpful."})
         self.assertEqual(msgs[1], {"role": "user", "content": "hi"})
 
-    def test_system_messages_inside_messages_are_hoisted(self):
+    def test_system_messages_inside_messages_stay_in_place_as_user_text(self):
         body = {"system": "Base.",
                 "messages": [{"role": "user", "content": "hi"},
-                             {"role": "system", "content": [{"type": "text", "text": "# Environment\ncwd: /x"}]},
-                             {"role": "system", "content": "Reminder."}]}
+                             {"role": "system", "content": [{"type": "text", "text": "# Environment\ncwd: /x"}]}]}
         msgs = tr.convert_messages(body)
-        self.assertEqual(msgs[0], {"role": "system", "content": "Base.\n\n# Environment\ncwd: /x\n\nReminder."})
-        self.assertEqual([m["role"] for m in msgs], ["system", "user"])
+        self.assertEqual(msgs[0], {"role": "system", "content": "Base."})  # prefix unchanged -> cacheable
+        self.assertEqual([m["role"] for m in msgs], ["system", "user", "user"])
+        self.assertEqual(msgs[2]["content"], "<system-reminder>\n# Environment\ncwd: /x\n</system-reminder>")
+
+    def test_cached_tokens_become_cache_read_input_tokens(self):
+        usage = tr.usage_of({"prompt_tokens": 5000, "completion_tokens": 7,
+                             "prompt_tokens_details": {"cached_tokens": 4000}})
+        self.assertEqual(usage, {"input_tokens": 1000, "output_tokens": 7, "cache_read_input_tokens": 4000})
+        self.assertEqual(tr.usage_of({"prompt_tokens": 5, "completion_tokens": 1}),
+                         {"input_tokens": 5, "output_tokens": 1})
+
+    def test_long_or_invalid_mcp_tool_names_are_shortened_and_restored(self):
+        long_name = "mcp__plugin_some_really_long_server_name_here__browser_take_full_page_screenshot"
+        dotted = "mcp__my.server__do-it"
+        safe_long, safe_dotted = tr.tool_name(long_name), tr.tool_name(dotted)
+        for safe in (safe_long, safe_dotted):
+            self.assertRegex(safe, r"^[A-Za-z0-9_-]{1,64}$")
+        self.assertEqual(tr.tool_name("mcp__plugin_playwright_playwright__browser_navigate"),
+                         "mcp__plugin_playwright_playwright__browser_navigate")  # valid names untouched
+        body = {"stream": True, "tools": [{"name": long_name, "input_schema": {"type": "object"}}],
+                "messages": [{"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": long_name, "input": {}}]},
+                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}]}
+        req = tr.to_openai(body, "m")
+        self.assertEqual(req["tools"][0]["function"]["name"], safe_long)
+        self.assertEqual(req["messages"][0]["tool_calls"][0]["function"]["name"], safe_long)
+        names = tr.tool_name_map(body)
+        st = tr.StreamTranslator("c", names)
+        st.feed({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "x", "function": {"name": safe_long, "arguments": "{}"}}]},
+                              "finish_reason": "tool_calls"}]})
+        self.assertEqual(st.tool_blocks()[0]["name"], long_name)
+        msg = tr.from_openai({"choices": [{"message": {"tool_calls": [{"id": "y", "function": {"name": safe_long, "arguments": "{}"}}]}}]},
+                             "c", names)
+        self.assertEqual(msg["content"][0]["name"], long_name)
 
     def test_tool_ids_are_nine_alphanumerics_and_stable(self):
         tid = tr.tool_id("toolu_01ABCdef")
@@ -66,6 +97,19 @@ class RequestTests(unittest.TestCase):
         msgs = tr.convert_messages(body)
         self.assertEqual(msgs[1]["content"], "Error: boom")
         self.assertEqual(msgs[2]["content"][1]["image_url"]["url"], "data:image/png;base64,AAA")
+
+    def test_images_replaced_by_a_note_for_text_only_models(self):
+        body = {"messages": [
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "t", "name": "shot", "input": {}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t", "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAA"}}]},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "BBB"}},
+                {"type": "text", "text": "what's on it?"}]}]}
+        flat = json.dumps(tr.to_openai(body, "m", vision=False))
+        self.assertNotIn("image_url", flat)
+        self.assertEqual(flat.count("image omitted"), 2)
+        self.assertIn("image_url", json.dumps(tr.to_openai(body, "m", vision=True)))
 
     def test_to_openai_tools_clamp_and_extra_body(self):
         body = {"model": "claude", "max_tokens": 32000, "stream": True, "temperature": 1,

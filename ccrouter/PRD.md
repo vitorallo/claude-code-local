@@ -63,7 +63,7 @@ One developer on a Mac, already using `cclocal`.
 **Non-functional**
 
 - Two dependencies (httpx, PyYAML), own venv, stdlib HTTP server. Two source files a person can read in one sitting.
-- Real keys live only in gitignored `config.yaml` (chmod 600); only `config.example.yaml` is published.
+- Real keys live only in gitignored `config.yaml` (chmod 600); only `config.yaml.example` is published.
 - Adds no latency worth measuring next to the provider's own.
 
 ## Success criteria

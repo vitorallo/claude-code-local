@@ -1,0 +1,68 @@
+# ccrouter config template. install.sh copies it to config.yaml (gitignored, chmod 600).
+#
+# Easiest: run `ccroutermgmt`, select a profile, press k and paste its key, press t to test.
+# Or edit this file by hand: replace the xxxx placeholders with your keys.
+# A profile whose key still contains xxxx is skipped until you set it.
+#
+#   cclocal --ccrouter        choose a profile from a menu
+#   cclocal --ccrouter 1      start on profile 1
+#   cclocal --ccrouter R      start on a random profile
+#
+# The router stays on its profile until a request fails, then moves to another
+# enabled profile and retries that same request:
+#   - a limit: HTTP 429/402, quota or credit errors (cooldown: Retry-After, else 60s;
+#     credit exhaustion = rest of the session)
+#   - overloaded: HTTP 503/529 or "overloaded" (cooldown 30s)
+#   - slow: nothing back within first_token_timeout seconds (cooldown 120s) — only
+#     when another profile is available; alone, it waits as long as it takes
+# Every provider here must speak OpenAI /v1/chat/completions; base_url is
+# everything before /chat/completions. More providers: providers.yaml.
+
+listen:
+  host: 127.0.0.1
+  port: 8787
+
+log:
+  level: info          # debug | info | warning
+  bodies: true         # full request/response per call in logs/bodies/
+  bodies_keep: 100     # newest N body files kept
+
+profiles:
+  1:
+    # NVIDIA — key from https://build.nvidia.com/settings/api-keys (free, starts with nvapi-)
+    name: nvidia-nemotron-super         # fast: ~0.5s text, ~1.2s tool call
+    base_url: https://integrate.api.nvidia.com/v1
+    api_key: nvapi-xxxx
+    model: nvidia/nemotron-3-super-120b-a12b
+    context: 1000000
+    max_output: 16384                   # Claude Code's max_tokens is clamped to this
+    first_token_timeout: 30             # rotate after this many seconds of silence
+    extra_body:                         # merged into every upstream request
+      chat_template_kwargs:
+        enable_thinking: false
+        force_nonempty_content: true
+
+  2:
+    # Mistral — key from https://console.mistral.ai (free "Experiment" plan: phone
+    # verification, pick the plan under Billing first; it opts you into data training)
+    name: mistral-codestral             # coding model: ~0.3s text, ~2s tool call
+    base_url: https://api.mistral.ai/v1
+    api_key: mistral-xxxx
+    model: codestral-latest
+    context: 128000
+    first_token_timeout: 30
+
+  3:
+    # Same NVIDIA key as profile 1. Stronger model, but the free queue is ~65s per request.
+    name: nvidia-nemotron-ultra
+    enabled: false
+    base_url: https://integrate.api.nvidia.com/v1
+    api_key: nvapi-xxxx
+    model: nvidia/nemotron-3-ultra-550b-a55b
+    context: 1000000
+    max_output: 16384
+    first_token_timeout: 150
+    extra_body:
+      chat_template_kwargs:
+        enable_thinking: false
+        force_nonempty_content: true
