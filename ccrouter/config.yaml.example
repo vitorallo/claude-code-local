@@ -49,7 +49,7 @@ profiles:
     base_url: https://api.mistral.ai/v1
     api_key: mistral-xxxx
     model: codestral-latest
-    context: 128000
+    context: 256000                     # Mistral's /v1/models reports max_context_length 256000
     first_token_timeout: 30
 
   3:

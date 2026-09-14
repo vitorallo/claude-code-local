@@ -49,6 +49,9 @@ DEFAULT_COOLDOWN = 60
 # Overloaded (503, "overloaded") or silent too long before the first byte:
 # also rotate, but the profile comes back sooner than after a limit.
 OVERLOAD_COOLDOWN = 30
+# Overloaded and nowhere to rotate to: retry the same profile after these pauses before passing
+# the 503 on. Each 503 Claude Code sees doubles its own back-off, which climbs to minutes.
+OVERLOAD_RETRY_DELAYS = (2, 5, 10)
 SLOW_COOLDOWN = 120
 DEFAULT_FIRST_TOKEN_TIMEOUT = 45
 
@@ -456,7 +459,8 @@ class Handler(BaseHTTPRequestHandler):
         self.tool_names = tr.tool_name_map(body)  # to restore MCP tool names the provider saw shortened
         profile = app.router.current()
         try:
-            for _ in range(len(app.router.profiles) + 1):
+            overload_retries = 0
+            for _ in range(len(app.router.profiles) + len(OVERLOAD_RETRY_DELAYS) + 1):
                 entry.update(profile=profile["num"], profile_name=profile["name"], model=profile["model"])
                 request = tr.to_openai(body, profile["model"], profile["max_output"], profile["extra_body"], profile["vision"])
                 attempt = {"profile": profile["num"], "openai_request": request}
@@ -482,6 +486,10 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json(502, tr.error_body(502, f"ccrouter: {profile['name']} unreachable: {e}"))
 
                 response, status, text, lines = got["response"], got["status"], got.get("text"), got.get("lines")
+                if stream and text is None:
+                    # open_upstream has already read the first chunk: this is the wait Claude Code sat through
+                    # (queueing, rotations), measured from when the request arrived.
+                    entry["ttft_ms"] = int((time.time() - started) * 1000)
                 if text is not None:
                     attempt.update(status=status, error=text)
                     log.warning("%s profile %d HTTP %d: %s", entry["id"], profile["num"], status, text[:500])
@@ -493,6 +501,14 @@ class Handler(BaseHTTPRequestHandler):
                                                 cooldown=None if limit else OVERLOAD_COOLDOWN)
                         if nxt:
                             profile = nxt
+                            continue
+                        if not limit and overload_retries < len(OVERLOAD_RETRY_DELAYS):
+                            pause = OVERLOAD_RETRY_DELAYS[overload_retries]
+                            overload_retries += 1
+                            entry["rotations"][-1]["reason"] = f"overloaded, retry {overload_retries} after {pause}s"
+                            log.warning("%s profile %d overloaded and no other profile available — retry %d in %ss",
+                                        entry["id"], profile["num"], overload_retries, pause)
+                            time.sleep(pause)
                             continue
                     if limit:
                         wait = app.router.soonest_available()
@@ -564,8 +580,6 @@ class Handler(BaseHTTPRequestHandler):
                 if chunk.get("error"):
                     raise RuntimeError(f"provider error mid-stream: {chunk['error']}")
                 events = translator.feed(chunk)
-                if "ttft_ms" not in entry and any(e["type"] != "message_start" for e in events):
-                    entry["ttft_ms"] = int((time.time() - began) * 1000)
                 if not events and time.time() - last_write > 5:
                     events = [{"type": "ping"}]  # keep Claude Code's stream alive while tool args buffer
                 for event in events:

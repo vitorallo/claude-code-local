@@ -56,7 +56,7 @@ providers:
     key_url: https://console.mistral.ai/api-keys
     free: monthly — free tier, ~1B tokens/month
     tos: caution
-    context: 128000
+    context: 256000   # codestral-latest per Mistral's /v1/models (2026-09-14)
     notes: >-
       Devstral and Codestral are coding-tuned. Free "Experiment" plan: phone
       verification, no card; choose the plan under Billing before the key works;

@@ -42,6 +42,13 @@ class FakeUpstream(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
+        elif self.path.startswith("/flaky") and self.server.flaky_failures > 0:
+            self.server.flaky_failures -= 1  # overloaded a set number of times, then fine
+            data = b'{"error": {"message": "Service temporarily overloaded", "code": 503}}'
+            self.send_response(503)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
         elif self.path.startswith("/overloaded"):
             # 200 header, then the error as the first chunk — what NVIDIA does
             self.send_response(200)
@@ -76,7 +83,9 @@ class RotationTests(unittest.TestCase):
     def setUpClass(cls):
         cls.upstream = ThreadingHTTPServer(("127.0.0.1", 0), FakeUpstream)
         cls.upstream.seen = []
+        cls.upstream.flaky_failures = 0
         cls.upstream_url = serve(cls.upstream)
+        ccrouter.OVERLOAD_RETRY_DELAYS = (0.05, 0.05, 0.05)  # keep the tests fast
 
     @classmethod
     def tearDownClass(cls):
@@ -158,11 +167,22 @@ class RotationTests(unittest.TestCase):
         self.assertEqual(self.router_server.app.router.active, 2)
         self.assertEqual(self.requests_log()[-1]["rotations"][0]["reason"], "overloaded")
 
-    def test_overloaded_with_nowhere_to_go_is_a_real_http_error(self):
+    def test_overloaded_with_nowhere_to_go_is_retried_then_a_real_http_error(self):
         self.start_router(["overloaded"])
+        before = len(self.upstream.seen)
         resp = self.post(stream=True)
         self.assertEqual(resp.status_code, 503)
         self.assertEqual(resp.json()["type"], "error")
+        self.assertEqual(len(self.upstream.seen) - before, 1 + len(ccrouter.OVERLOAD_RETRY_DELAYS))
+
+    def test_brief_overload_is_absorbed_by_retrying_the_same_profile(self):
+        self.upstream.flaky_failures = 2
+        self.start_router(["flaky"])
+        resp = self.post(stream=True)
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("event: message_stop", resp.text)
+        reasons = [r["reason"] for r in self.requests_log()[-1]["rotations"]]
+        self.assertEqual(reasons, ["overloaded, retry 1 after 0.05s", "overloaded, retry 2 after 0.05s"])
 
     def test_slow_start_rotates_when_another_profile_exists(self):
         self.start_router(["slow", "ok"], extra={"first_token_timeout": 0.5})

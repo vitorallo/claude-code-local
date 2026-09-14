@@ -227,7 +227,7 @@ profiles:
     base_url: https://api.mistral.ai/v1
     api_key: ...
     model: codestral-latest
-    context: 128000
+    context: 256000
 ```
 
 ### Top level
@@ -315,8 +315,11 @@ Run with the venv: `ccrouter/.venv/bin/python ccrouter/ccrouter.py …`
 
   "Slow" only applies when another profile is available; a profile on its own is waited on as long as it takes.
   An abandoned slow request is closed when it eventually answers.
-- If every profile is cooling down after a limit, Claude Code gets an Anthropic `rate_limit_error`; after an
-  overload it gets the provider's 503. Either way it retries on its own.
+- **Overloaded with nowhere to go** (a single profile, or all the others cooling down): the router retries the same
+  profile after 2 s, 5 s and 10 s before giving up. Claude Code backs off longer after every error it sees — up to
+  minutes (`Waiting for API response · will retry in 4m…`) — so absorbing a short overload here matters.
+- If every profile is cooling down after a limit, Claude Code gets an Anthropic `rate_limit_error`; if the overload
+  outlasts the retries it gets the provider's 503. Either way it then retries on its own, with its own back-off.
 - Other errors (401, 500, unreachable) don't rotate; they reach Claude Code as normal API errors.
 - A connection the provider dropped while idle (NVIDIA does this) is retried once on a fresh one.
 - `ccroutermgmt` → `a` switches the active profile by hand at any time.
@@ -431,7 +434,7 @@ AI Horde is keyless too but has no tool calling. The other "keyless" OmniRoute e
 | `t` shows `FAIL HTTP 429` | Free quota or rate limit — wait, or add a second profile so the router can fail over |
 | `port 8787 is already in use` | Another `cclocal --ccrouter` session is running; each session runs its own router |
 | Every turn takes a minute | You're on Nemotron **Ultra** (~65 s free queue). Use Super, or switch live with ccroutermgmt → `a` |
-| `Waiting for API response · will retry in 4m` | The provider kept failing (e.g. 503 overloaded) and Claude Code is backing off. With a second usable profile the router fails over instead — check the Live log tab |
+| `Waiting for API response · will retry in 4m` | Not a timeout — Claude Code's timeout is already 30 min under `cclocal`. It's back-off after repeated errors: the provider kept answering 503 overloaded (the router already retried it three times), or the router stopped while Claude Code was still open (`check your network`). Add a second usable profile so the router can fail over, avoid Nemotron Ultra on the free tier, and check the Live log for what failed |
 | ccroutermgmt says "router not running" but it is | That router predates the admin endpoints — restart `cclocal --ccrouter` |
 | `rate_limit_error: every profile has hit its limit` | All profiles cooling down. Add another profile, or wait the time in the message |
 | `response exceeded the N output token maximum` | The file being written is larger than `max_output` allows; raise it if the provider allows, or ask for the file in parts |
