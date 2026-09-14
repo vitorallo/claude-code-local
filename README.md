@@ -317,7 +317,7 @@ Getting them confused is the single most common way to mis-tune this setup:
 | `--max-kv-size` | **The context window.** KV cache bound per sequence. Past it, `RotatingKVCache` evicts the oldest tokens. | `32768` |
 | `--max-tokens` | Longest **single generation** when the client doesn't specify one. Peak memory during one reply — not the window. | `32768`, halved to `16384` by the memory preflight |
 | `--max-request-tokens` | Ceiling on the `max_tokens` a client is allowed to ask for. | engine default `32768`; `run.sh` doesn't set it |
-| `CLAUDE_CODE_MAX_OUTPUT_TOKENS` | What **Claude Code** requests per reply. This is what truncates a large `Write`. | `8192`, raise with `--out-tokens` |
+| `CLAUDE_CODE_MAX_OUTPUT_TOKENS` | What **Claude Code** requests per reply. This is what truncates a large `Write`. | `8192` local, `32000` remote, raise with `--out-tokens` |
 | `CLAUDE_CODE_MAX_CONTEXT_TOKENS` | The window **Claude Code believes it has**, and therefore when auto-compact fires. | 85% of `--max-kv-size`, for compaction headroom |
 
 Two consequences worth internalising:
@@ -542,6 +542,7 @@ cclocal --qwen38 --think             # Enable brief reasoning (reasoning_effort=
 cclocal --lmstudio                   # LM Studio's server on this Mac (needs 0.4.1+)
 cclocal --dgx-active                 # DGX Spark preset (MoE, faster)
 cclocal --dgx-idle                   # DGX Spark preset (dense, steadier)
+cclocal --api 192.168.1.50           # Any Anthropic-API box on your LAN (port 8080)
 cclocal --remote http://host:8000    # Any remote vLLM endpoint (model auto-detected)
 ```
 
@@ -562,8 +563,10 @@ isn't a surprise. Full root-cause writeups in [Why this is hard](#why-this-is-ha
   raise the GPU wired limit via `sudo` for the session (auto-reverted on exit,
   never persisted across reboot). Silent when there's ample headroom; `--safe`
   forces the menu, `--no-mem-check` skips it. See #17.
-- **Output budget.** `CLAUDE_CODE_MAX_OUTPUT_TOKENS` defaults to 8192 (raised
-  from a too-small value that silently truncated file writes); override with
+- **Output budget.** `CLAUDE_CODE_MAX_OUTPUT_TOKENS` defaults to 8192 locally
+  (raised from a too-small value that silently truncated file writes) and to
+  32000 in remote mode, capped at a quarter of the window the remote advertises
+  — the 8192 memory trade-off is a local-Mac concern. Override with
   `--out-tokens N`. See #18.
 - **No classifier stall.** The 8 built-in tools are pre-allowed
   (`--allowedTools`), so auto mode never makes the slow per-action
@@ -615,6 +618,10 @@ cclocal --dgx-active                      # preset: MoE box (faster)
 cclocal --dgx-idle                        # preset: dense box (steadier reasoning)
 cclocal --remote http://host:8000         # any remote vLLM endpoint
 cclocal --remote http://host:8000 --remote-model Qwen/Qwen3.6-35B-A3B   # override model
+
+cclocal --api 192.168.1.50                # host only → http://192.168.1.50:8080
+cclocal --api 192.168.1.50:8000           # explicit port
+cclocal --api 192.168.1.50 8000           # same, port as a separate argument
 ```
 
 - **Auto-detect.** With no `--remote-model`, the launcher reads the model id
@@ -622,6 +629,18 @@ cclocal --remote http://host:8000 --remote-model Qwen/Qwen3.6-35B-A3B   # overri
 - **Presets.** `--dgx-active` / `--dgx-idle` are convenience aliases — edit the
   `DGX_ACTIVE` / `DGX_IDLE` addresses near the top of `run.sh` to match your own
   boxes.
+- **`--api HOST[:PORT]`** is the same thing without a preset, for a box you
+  reach by address rather than by name: it builds the URL for you and defaults
+  the port to **8080** (`API_DEFAULT_PORT` in `run.sh`). Everything downstream —
+  health check, model auto-detect, skipping the local lifecycle — is the shared
+  remote path, so `--api` and `--remote` differ only in how you spell the
+  target. Use whichever is shorter to type. An `https://` target with no port
+  keeps 443 rather than being forced to 8080.
+- **Context window.** The launcher reads `max_model_len` (vLLM) or
+  `max_context_length` (LM Studio) from `/v1/models` and passes 85% of it as
+  `CLAUDE_CODE_MAX_CONTEXT_TOKENS`. Without that, Claude Code assumes 200k for
+  any model id it doesn't recognise and warns about it — badly wrong in both
+  directions on a 256k box.
 - **Nothing local runs.** vllm-mlx isn't required in remote mode (only the
   `claude` CLI). The remote box's own batching handles concurrency, so the
   single-request OOM safeguards (#7, #17) don't apply.
@@ -679,7 +698,7 @@ it and what fixes it. Several present identically from the client — a generic
 them is reading `server.log`.
 
 <details>
-<summary><strong>All 31 problems</strong> (click to expand)</summary>
+<summary><strong>All 32 problems</strong> (click to expand)</summary>
 
 1. [Fake tool calls (historical — fixed upstream)](#1-fake-tool-calls-historical-fixed-upstream)
 2. [`end_turn` vs `stop` (the loop killer)](#2-end_turn-vs-stop-the-loop-killer)
@@ -712,6 +731,7 @@ them is reading `server.log`.
 29. [Two cclocal sessions fight over port 8000](#29-two-cclocal-sessions-fight-over-port-8000)
 30. [Evaluating a new model: check that it *writes files*, not that it answers](#30-evaluating-a-new-model-check-that-it-writes-files-not-that-it-answers)
 31. [Every tool request returns HTTP 500 (union types in tool schemas)](#31-every-tool-request-returns-http-500-union-types-in-tool-schemas)
+32. [`400 Unexpected reasoning effort high`](#32-400-unexpected-reasoning-effort-high)
 
 </details>
 
@@ -1569,6 +1589,51 @@ never got a chance to be wrong.
 
 ---
 
+### 32. `400 Unexpected reasoning effort high`
+
+**Symptom**: the very first request of the session dies. Nothing in the log
+about tools, memory, or the model — just:
+
+```
+API Error: 400 Unexpected reasoning effort high.
+           Supported types are xhigh (default), medium, and low.
+```
+
+**Cause**: Claude Code 2.1+ sends an effort level with every request
+(`output_config: {"effort": "high"}` — "high" is its default), and a server
+that forwards the value into the chat template hands it to a model that may
+not define that rung. Qwen3.8's template validates against exactly three:
+
+```jinja
+{%- if reasoning_effort not in ["xhigh", "medium", "low"] %}
+{{- raise_exception('Unexpected reasoning effort ' ~ reasoning_effort ...) }}
+```
+
+`high` is not among them — and neither is `max`. The names look like a
+spectrum, so the mismatch reads as a server bug rather than a vocabulary gap.
+Measured against a vLLM box serving Qwen3.8-Flash-Next:
+
+| `output_config.effort` | Result |
+|---|---|
+| `low` | ✅ |
+| `medium` | ✅ |
+| `xhigh` | ✅ |
+| `high` | ❌ 400 |
+| `max` | ❌ 400 |
+
+Nothing else triggers it. `thinking.budget_tokens` (any size), a top-level
+`reasoning_effort`, and `thinking: {type: disabled}` all pass through
+untouched — only `output_config.effort` reaches the template.
+
+**Solution**: `run.sh` pins `CLAUDE_CODE_EFFORT_LEVEL=low`, which is both a
+rung every such template defines and the right default for a model generating
+at a fraction of cloud speed. `--think` raises it to `medium`. Override with
+`--effort <level>`; `--effort unset` stops Claude Code sending the field at
+all, leaving the server's own default — on Qwen3.8 that is `xhigh`, which is
+the slowest thing it can do.
+
+---
+
 ## Troubleshooting
 
 **Start with `server.log`.** Claude Code reports every backend failure as a
@@ -1592,7 +1657,10 @@ Every entry in the table below was first diagnosed that way.
 | `RuntimeError: There is no Stream(gpu, N) in current thread` | Old pinned venv (mlx 0.31.1 era) | Re-run `./install.sh` — fixed upstream in vllm-mlx PR #452, see [#13](#13-vllm-mlx-critical-bug-missing-return-statement-historical) |
 | Qwen3.8 won't load / unknown architecture | venv still pinned to `mlx-lm==0.31.1` | Re-run `./install.sh`. Qwen3.8 needs mlx-lm 0.31.3+; it runs on the `qwen3_5` architecture, which older mlx-lm has but the pinned stack couldn't reach |
 | Model loads, then the whole Mac stalls / heavy swapping | Almost always the cache budget, not the weights | See [#23](#23-everything-works-but-is-unusably-slow-cache-budget-vs-weights); if it persists, take preflight option 2 (`iogpu.wired_limit_mb` → 21504) |
+| `API Error: 400 Unexpected reasoning effort high` | Claude Code's default effort level isn't a rung the model's chat template defines | Fixed in `run.sh` (`CLAUDE_CODE_EFFORT_LEVEL=low`); override with `--effort` — see [#32](#32-400-unexpected-reasoning-effort-high) |
+| `"model-name" is not a model this version of Claude Code recognizes` | Claude Code assumes a 200k window for unknown model ids | `run.sh` sets `CLAUDE_CODE_MAX_CONTEXT_TOKENS` from the real bound — the catalog's `--max-kv-size` locally, `max_model_len` from `/v1/models` in remote mode. If a remote doesn't advertise one, the warning is cosmetic |
 | Qwen3.8 thinks for minutes before doing anything | Thinking left on at the model's `xhigh` default | Don't pass `--think`. Off is the default; `--think` uses `reasoning_effort=low` — see [#3](#3-reasoningthinking-tokens-garbage-output) |
+| `API Error: Claude's response exceeded the 8192 output token maximum` | The reply (a large `Write`, or reasoning, which counts against the same cap) ran past `CLAUDE_CODE_MAX_OUTPUT_TOKENS`. `run.sh` sets that variable itself, so exporting it in your shell does nothing | `--out-tokens 32000`. Remote mode now defaults to 32000. If a higher cap only delays the error, the model is looping; check the server's log — see [#18](#18-writeedit-tool-call-silently-does-nothing-no-error) |
 | Tool call returns "⚠ The previous tool call was discarded…" | A tool call was truncated by the output-token cap | Working as intended — that's the fail-loud notice. Raise `--out-tokens 16384`, or let the model write the file in sections — see [#18](#18-writeedit-tool-call-silently-does-nothing-no-error) |
 | vllm-mlx crashes on startup (TypeError: NoneType) | Using unpatched upstream | `./install.sh` installs from our fork which has the fix |
 | Model generates text about tools but nothing executes | The model emitted a markdown block instead of a tool call | Check with the one-liner in [#1](#1-fake-tool-calls-historical-fixed-upstream); if the model does this consistently it can't drive Claude Code — see [#30](#30-evaluating-a-new-model-check-that-it-writes-files-not-that-it-answers) |
@@ -1626,7 +1694,7 @@ Every entry in the table below was first diagnosed that way.
 | `ANTHROPIC_MODEL` | Full HuggingFace ID | Model identifier |
 | `ANTHROPIC_DEFAULT_*_MODEL` | Same as above | Route all tiers (Opus/Sonnet/Haiku) locally |
 | `CLAUDE_CODE_SUBAGENT_MODEL` | Same as above | Route subagent calls locally |
-| `CLAUDE_CODE_MAX_OUTPUT_TOKENS` | `8192` default, `--out-tokens N` to override | Output cap; must fit a whole Write/Edit file body (see #18) |
+| `CLAUDE_CODE_MAX_OUTPUT_TOKENS` | `8192` local / `32000` remote (≤ ¼ of the remote window), `--out-tokens N` to override | Output cap; must fit a whole Write/Edit file body (see #18) |
 | `CLAUDE_CODE_MAX_CONTEXT_TOKENS` | 85% of `--max-kv-size` (local runs only) | The window Claude Code assumes, so auto-compact fires — with headroom to run — before the KV cache evicts (see #20) |
 | `CLAUDE_CODE_ATTRIBUTION_HEADER` | `0` | Prevents KV cache invalidation |
 | `DISABLE_PROMPT_CACHING` | `1` | Local server doesn't support Anthropic caching |
@@ -1661,9 +1729,11 @@ Every entry in the table below was first diagnosed that way.
 |------------|---------|
 | `--safe` / `CCLOCAL_FORCE_MEMCHECK=1` | Always show the memory-safeguard menu, for any model (see #17) |
 | `--no-mem-check` / `CCLOCAL_NO_MEMCHECK=1` | Skip the GPU-headroom preflight prompt (see #17) |
-| `--out-tokens N` | Max output tokens Claude Code requests (default 8192; raise to 16384 for large file writes — see #18) |
+| `--out-tokens N` | Max output tokens Claude Code requests (default 8192 local, 32000 remote; raise to 16384 for large local file writes — see #18) |
 | `--think` | Enable brief reasoning (`reasoning_effort=low`) instead of none (see #3) |
+| `--effort LEVEL` | Effort Claude Code asks for: `low` (default), `medium` (with `--think`), `xhigh`, or `unset` to send nothing (see [#32](#32-400-unexpected-reasoning-effort-high)) |
 | `--lmstudio` | Point at LM Studio's server on this Mac instead of running vllm-mlx (see [Remote backend](#remote-backend-dgx-spark-or-any-vllm-box)) |
+| `--api HOST[:PORT]` | Point at any box serving the Anthropic Messages API; port defaults to 8080 (see [Remote backend](#remote-backend-dgx-spark-or-any-vllm-box)) |
 | `iogpu.wired_limit_mb` | Optionally raised via `sudo sysctl` by preflight option 2; **per-session only** — reverted on exit (prompts for sudo at shutdown if creds expired), and resets on reboot |
 
 ### Claude Code flags (set by run.sh)

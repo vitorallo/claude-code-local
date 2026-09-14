@@ -5,16 +5,26 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 MCP_CONFIG="$SCRIPT_DIR/mcp-local.json"
 HF_CACHE="$HOME/.cache/huggingface/hub"
 
-# Remote backend presets — any box running vLLM with the native Anthropic
-# Messages API (recent vLLM ships /v1/messages with real tool_use blocks).
-# Edit these to match your own boxes (Tailscale addresses shown).
-DGX_ACTIVE="http://100.96.179.64:8000"   # Qwen3.6-35B-A3B (MoE, faster)
-DGX_IDLE="http://100.126.117.58:8000"    # Qwen3.6-27B (dense, steadier)
+# Remote backend presets — any box running vLLM or SGLang with the native
+# Anthropic Messages API (recent vLLM/SGLang both ship /v1/messages with real
+# tool_use blocks). Edit these to match your own boxes (Tailscale addresses
+# shown). Both point at a single box on two ports, not two boxes — only one
+# model runs at a time (unified memory) — so these mean "which model I last
+# started there", not "which box is free". Check what is actually serving
+# before using either: a port nothing listens on just fails the reachability
+# check.
+DGX_ACTIVE="http://100.96.179.64:8888"   # Qwen3.8-27B via SGLang+DFlash2 (fast, speculative decoding)
+DGX_IDLE="http://100.96.179.64:18300"    # Qwen3.8-Flash-Next (125B MoE, PLE mmap) via vLLM
 
 # LM Studio's local server. Since 0.4.1 it serves a native Anthropic
 # /v1/messages endpoint (SSE + tool calls), so it works with the same remote
 # plumbing as a vLLM box. Start it with `lms server start`.
 LMSTUDIO_URL="http://127.0.0.1:1234"
+
+# --api default port. Anything speaking the Anthropic Messages API works —
+# llama.cpp's server, Ollama, another Mac running this script with --server,
+# a vLLM box on a non-standard port.
+API_DEFAULT_PORT=8080
 
 # =============================================================================
 # Model catalog (single source of truth)
@@ -666,11 +676,15 @@ ${BOLD}Server options${RESET}
   --port N        Server port (default: 8000)
   --no-mem-check  Skip the RAM-headroom preflight prompt
   --safe          Always show the memory-safeguard menu (force, any model)
-  --out-tokens N  Max output tokens Claude Code requests (default 8192;
-                  raise for large file writes, e.g. 16384)
+  --out-tokens N  Max output tokens Claude Code requests (default 8192 local,
+                  32000 remote; raise for large file writes, e.g. 16384)
   --think         Enable brief reasoning (reasoning_effort=low) instead of
                   none. Costs latency; thinking is emitted as structured
                   Anthropic thinking blocks, never leaked into the text.
+  --effort LEVEL  Effort Claude Code asks for: low ${DIM}(default)${RESET}, medium
+                  ${DIM}(with --think)${RESET}, xhigh, or ${DIM}unset${RESET} to send nothing.
+                  ${DIM}Claude Code's own default is "high", which Qwen3.8's chat${RESET}
+                  ${DIM}template rejects outright — hence the low default here.${RESET}
 
 ${BOLD}Remote backend${RESET} ${DIM}(skip the local server, connect to a remote vLLM box)${RESET}
   --dgx-active    DGX Spark preset ${DIM}($DGX_ACTIVE)${RESET}
@@ -678,6 +692,10 @@ ${BOLD}Remote backend${RESET} ${DIM}(skip the local server, connect to a remote 
   --lmstudio      LM Studio on this Mac ${DIM}($LMSTUDIO_URL)${RESET}
                   ${DIM}Needs LM Studio 0.4.1+ (native Anthropic /v1/messages);${RESET}
                   ${DIM}start it with \`lms server start\`.${RESET}
+  --api HOST[:PORT]
+                  Any box speaking the Anthropic Messages API, on your LAN or
+                  ${DIM}elsewhere. Port defaults to $API_DEFAULT_PORT; a bare port may also${RESET}
+                  ${DIM}follow:  --api 192.168.1.50 8000${RESET}
   --remote URL    Any remote vLLM endpoint, e.g. http://host:8000
   --remote-model ID  Override model (default: auto-detect from /v1/models)
 
@@ -694,9 +712,37 @@ ${BOLD}Examples${RESET}
   cclocal --qwen38         ${DIM}# direct launch, Qwen3.8-27B${RESET}
   cclocal --qwen38 --think ${DIM}# ...with brief reasoning enabled${RESET}
   cclocal --lmstudio       ${DIM}# use LM Studio's server on this Mac${RESET}
+  cclocal --api 192.168.1.50  ${DIM}# any Anthropic-API box, port $API_DEFAULT_PORT${RESET}
   cclocal --dgx-active     ${DIM}# remote DGX Spark (MoE box)${RESET}
   cclocal --remote http://host:8000  ${DIM}# any remote vLLM box${RESET}
 EOF
+}
+
+# Build a base URL from an --api target. Accepts a bare host (192.168.1.50),
+# host:port, or a full URL; $2 is an explicit port that wins over any in $1.
+# Anything without a port falls back to $API_DEFAULT_PORT.
+_api_url() {
+    local target="$1" port="${2:-}" scheme="http"
+    if [[ "$target" == *://* ]]; then
+        scheme="${target%%://*}"
+        target="${target#*://}"
+    fi
+    target="${target%%/*}"                       # drop any path
+    if [[ "$target" == *:* ]]; then
+        [[ -n "$port" ]] || port="${target##*:}"
+        target="${target%%:*}"
+    fi
+    if [[ -z "$target" ]]; then
+        printf "${RED}ERROR: --api needs a host, e.g. --api 192.168.1.50${RESET}\n" >&2
+        return 1
+    fi
+    # An https target with no port keeps the scheme default (443) — forcing
+    # $API_DEFAULT_PORT onto it would be wrong. Bare hosts get the default.
+    if [[ -z "$port" && "$scheme" == "https" ]]; then
+        printf '%s://%s' "$scheme" "$target"
+    else
+        printf '%s://%s:%s' "$scheme" "$target" "${port:-$API_DEFAULT_PORT}"
+    fi
 }
 
 # =============================================================================
@@ -708,6 +754,9 @@ PORT=8000
 SERVER_ONLY=false
 REMOTE_URL=""      # set by --remote / --dgx-* ; empty = local vllm-mlx
 REMOTE_MODEL=""    # optional override; else auto-detected from /v1/models
+API_TARGET=""      # the raw --api argument, kept for the error message
+REMOTE_CTX=""      # remote's max_model_len, read from /v1/models
+EFFORT_LEVEL=""    # --effort; else derived from --think below
 ENABLE_THINKING=false   # --think: reasoning_effort=low instead of no thinking
 TOOL_PARSER="auto"      # resolved from the catalog once MODEL is known
 REASONING_PARSER=""     # ditto; applied even without --think (see catalog)
@@ -743,7 +792,25 @@ while [[ $# -gt 0 ]]; do
         --dgx-active)    REMOTE_URL="$DGX_ACTIVE"; shift ;;
         --dgx-idle)      REMOTE_URL="$DGX_IDLE"; shift ;;
         --lmstudio)      REMOTE_URL="$LMSTUDIO_URL"; shift ;;
+        --api)
+            # --api HOST[:PORT]  (default port $API_DEFAULT_PORT)
+            if [[ $# -lt 2 || "$2" == -* ]]; then
+                printf "${RED}ERROR: --api needs a host, e.g. --api 192.168.1.50${RESET}\n" >&2
+                exit 1
+            fi
+            API_TARGET="$2"
+            shift 2
+            # A bare number may follow as the port:  --api 192.168.1.50 8000
+            if [[ $# -gt 0 && "$1" =~ ^[0-9]+$ ]]; then
+                REMOTE_URL=$(_api_url "$API_TARGET" "$1") || exit 1
+                API_TARGET="$API_TARGET:$1"
+                shift
+            else
+                REMOTE_URL=$(_api_url "$API_TARGET") || exit 1
+            fi
+            ;;
         --think)         ENABLE_THINKING=true; shift ;;
+        --effort)        EFFORT_LEVEL="$2"; shift 2 ;;
         --no-mem-check) CCLOCAL_NO_MEMCHECK=1; shift ;;
         --safe)         CCLOCAL_FORCE_MEMCHECK=1; shift ;;
         --out-tokens)   CC_OUTPUT_TOKENS_OVERRIDE="$2"; shift 2 ;;
@@ -831,12 +898,25 @@ if [[ -n "$REMOTE_URL" ]]; then
             echo "  - Is LM Studio's server running?  (lms server start)"
             echo "  - Is a model loaded?  (lms ps)"
             echo "  - LM Studio 0.4.1+ is required for the Anthropic /v1/messages endpoint."
+        elif [[ -n "$API_TARGET" ]]; then
+            echo "  - Is anything listening on $REMOTE_URL ?"
+            if [[ "$API_TARGET" != *:* ]]; then
+                echo "  - Port defaulted to $API_DEFAULT_PORT. If the box uses another one:"
+                echo "      cclocal --api $API_TARGET:8000"
+            fi
+            if [[ "$API_TARGET" == 100.* ]]; then
+                echo "  - That's a Tailscale address: is Tailscale up on both ends?  (tailscale status)"
+            fi
+            echo "  - Does that server speak the Anthropic /v1/messages API (not just /v1/chat/completions)?"
         else
             echo "  - Is the remote box actually serving vLLM on that address/port?"
             echo "  - If it's a Tailscale address (100.x), is Tailscale up?  (tailscale status)"
         fi
         exit 1
     fi
+
+    # One fetch, two answers: the model id and the context window.
+    models_json=$(curl -s -m 8 "$REMOTE_URL/v1/models" 2>/dev/null || true)
 
     # Model: explicit override wins, else auto-detect from /v1/models
     if [[ -n "$REMOTE_MODEL" ]]; then
@@ -845,7 +925,7 @@ if [[ -n "$REMOTE_URL" ]]; then
         # Whitespace-tolerant: LM Studio pretty-prints ("id": "x"), vLLM is
         # compact ("id":"x"). `|| true` keeps a no-match from tripping `set -e`
         # so the empty-check below reports a clear error instead of a silent bail.
-        MODEL=$(curl -s -m 8 "$REMOTE_URL/v1/models" 2>/dev/null \
+        MODEL=$(printf '%s' "$models_json" \
             | grep -oE '"id"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 \
             | sed -E 's/.*:[[:space:]]*"([^"]*)".*/\1/' || true)
         if [[ -z "$MODEL" ]]; then
@@ -856,6 +936,14 @@ if [[ -n "$REMOTE_URL" ]]; then
     fi
     MODEL_NAME_DISPLAY="$MODEL"
     BASE_URL="$REMOTE_URL"
+
+    # Context window. vLLM advertises max_model_len per model; LM Studio uses
+    # max_context_length. Without it Claude Code assumes 200k, says so in a
+    # warning, and compacts at the wrong point in both directions. Smallest
+    # wins if the box serves several models.
+    REMOTE_CTX=$(printf '%s' "$models_json" \
+        | grep -oE '"(max_model_len|max_context_length)"[[:space:]]*:[[:space:]]*[0-9]+' \
+        | grep -oE '[0-9]+$' | sort -n | head -1 || true)
 else
     BASE_URL="http://127.0.0.1:$PORT"
 fi
@@ -996,7 +1084,21 @@ fi
 # vs the old 4096 while costing less generation memory than 16384. Override
 # per-run with `--out-tokens N` (e.g. 16384 for big files; pair with `--safe`
 # to raise the GPU limit if a large model OOMs).
-CC_OUTPUT_TOKENS="${CC_OUTPUT_TOKENS_OVERRIDE:-8192}"
+#
+# That memory argument is ours alone. In remote mode the box has its own
+# budget, and 8192 just ends long writes (or reasoning, which counts against the
+# same cap) in "response exceeded the 8192 output token maximum". Use Claude
+# Code's own 32000 there, capped at a quarter of the advertised window so a
+# small remote context still leaves room for the prompt.
+if [[ -n "$REMOTE_URL" ]]; then
+    CC_OUTPUT_DEFAULT=32000
+    if [[ -n "$REMOTE_CTX" && $(( REMOTE_CTX / 4 )) -lt $CC_OUTPUT_DEFAULT ]]; then
+        CC_OUTPUT_DEFAULT=$(( REMOTE_CTX / 4 ))
+    fi
+else
+    CC_OUTPUT_DEFAULT=8192
+fi
+CC_OUTPUT_TOKENS="${CC_OUTPUT_TOKENS_OVERRIDE:-$CC_OUTPUT_DEFAULT}"
 
 # CLAUDE_CODE_MAX_CONTEXT_TOKENS — the context window Claude Code assumes, and
 # therefore when auto-compact fires.
@@ -1009,9 +1111,10 @@ CC_OUTPUT_TOKENS="${CC_OUTPUT_TOKENS_OVERRIDE:-8192}"
 # the model quietly forgot the start of the conversation — looking like the
 # model going stupid, not like a misconfiguration.
 #
-# So pin it to the window we actually serve. In remote mode we don't know the
-# remote's bound — it may well be far larger — so leave it unset and let
-# Claude Code use its own default.
+# So pin it to the window we actually serve. In remote mode the bound is the
+# remote's, not ours — read it from /v1/models (max_model_len) and use that.
+# If the endpoint doesn't advertise one, leave it unset and let Claude Code
+# fall back to its own default.
 # A custom --model isn't in the catalog and has no KV size, so fall back to a
 # conservative default rather than leaving Claude Code on its 200k assumption.
 #
@@ -1024,6 +1127,25 @@ CC_OUTPUT_TOKENS="${CC_OUTPUT_TOKENS_OVERRIDE:-8192}"
 CC_CONTEXT_TOKENS=""
 if [[ -z "$REMOTE_URL" ]]; then
     CC_CONTEXT_TOKENS=$(( ${MAX_KV_SIZE:-32768} * 85 / 100 ))
+elif [[ -n "$REMOTE_CTX" ]]; then
+    CC_CONTEXT_TOKENS=$(( REMOTE_CTX * 85 / 100 ))
+fi
+
+# CLAUDE_CODE_EFFORT_LEVEL — Claude Code 2.1+ sends output_config.effort, and
+# its default is "high". Servers that hand the value straight to the chat
+# template hit models that don't define that rung: Qwen3.8's template accepts
+# only xhigh (its default), medium and low, and raises on anything else —
+#
+#   API Error: 400 Unexpected reasoning effort high.
+#              Supported types are xhigh (default), medium, and low.
+#
+# — which kills the session on the first request. "low" is both a rung every
+# such template defines and the right default for a model generating at a
+# fraction of cloud speed; --think moves it to medium. Override with
+# --effort <level>; --effort unset stops Claude Code sending the field at all,
+# leaving the server's own default (xhigh on Qwen3.8 — slow).
+if [[ -z "$EFFORT_LEVEL" ]]; then
+    EFFORT_LEVEL=$([[ "$ENABLE_THINKING" == "true" ]] && echo medium || echo low)
 fi
 
 # Environment variables passed to Claude Code. Kept as a single array so the
@@ -1037,6 +1159,7 @@ CLAUDE_ENV=(
     "ANTHROPIC_DEFAULT_HAIKU_MODEL=$MODEL"
     "CLAUDE_CODE_SUBAGENT_MODEL=$MODEL"
     "CLAUDE_CODE_MAX_OUTPUT_TOKENS=$CC_OUTPUT_TOKENS"
+    "CLAUDE_CODE_EFFORT_LEVEL=$EFFORT_LEVEL"
     # Claude Code's client-side timeouts assume a cloud API. A local model is
     # one to two orders of magnitude slower, and it is the CLIENT that gives up
     # first — the server keeps generating happily while Claude Code reports
