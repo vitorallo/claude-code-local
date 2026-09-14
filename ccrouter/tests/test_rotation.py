@@ -5,6 +5,7 @@ import logging
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -94,8 +95,18 @@ class RotationTests(unittest.TestCase):
         self.router_server.server_close()
         self.tmp.cleanup()
 
-    def requests_log(self):
-        return [json.loads(line) for line in (self.logdir / "requests.jsonl").read_text().splitlines()]
+    def requests_log(self, expect=1):
+        # The router writes its log after the response goes out, so wait for
+        # the record, then take the write lock so any body pruning is finished.
+        path = self.logdir / "requests.jsonl"
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            lines = path.read_text().splitlines() if path.exists() else []
+            if len(lines) >= expect:
+                break
+            time.sleep(0.02)
+        with self.router_server.app.write_lock:
+            return [json.loads(line) for line in path.read_text().splitlines()]
 
     def post(self, stream=False):
         body = {"model": "claude-x", "max_tokens": 100, "stream": stream,
@@ -148,6 +159,7 @@ class RotationTests(unittest.TestCase):
         self.start_router(["ok"])
         for _ in range(3):
             self.post()
+        self.requests_log(expect=3)
         self.assertEqual(len(list((self.logdir / "bodies").glob("*.json"))), 2)
         for path in self.logdir.rglob("*"):
             if path.is_file():

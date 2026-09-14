@@ -54,7 +54,7 @@ thinking off via `chat_template_kwargs.enable_thinking=false`; `stream_options` 
 ### Docs and publishing
 - [x] `PRD.md`, `README.md`, this plan
 - [x] Root README: ccrouter section + flag row
-- [ ] Public mirror: publish code/docs/example config only; verify no real key before push
+- [x] Public mirror: publish code/docs/example config only; verify no real key before push; fresh clone passes tests
 
 ### Later (not now)
 - [ ] `show_thinking` option: emit reasoning as Anthropic thinking blocks
