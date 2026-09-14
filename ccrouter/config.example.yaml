@@ -1,0 +1,81 @@
+# ccrouter config. Copy to config.yaml (gitignored, keep it chmod 600) and add your keys.
+#
+#   cclocal --ccrouter        start on profile 1
+#   cclocal --ccrouter 2      start on profile 2
+#   cclocal --ccrouter R      start on a random profile
+#
+# The router stays on its profile until a request fails for hitting a limit
+# (HTTP 429/402, quota or credit errors), then rotates to another profile and
+# retries that same request. Every provider here must speak OpenAI
+# /v1/chat/completions; base_url is everything before /chat/completions.
+
+listen:
+  host: 127.0.0.1
+  port: 8787
+
+log:
+  level: info          # debug | info | warning
+  bodies: true         # full request/response per call in logs/bodies/
+  bodies_keep: 100     # newest N body files kept
+
+profiles:
+  1:
+    name: nvidia-nemotron-ultra
+    base_url: https://integrate.api.nvidia.com/v1
+    api_key: nvapi-xxxx               # from build.nvidia.com; or use api_key_env: NVIDIA_API_KEY
+    model: nvidia/nemotron-3-ultra-550b-a55b
+    context: 1000000
+    max_output: 16384                 # Claude Code's max_tokens is clamped to this
+    extra_body:                       # merged into every upstream request
+      chat_template_kwargs:
+        enable_thinking: false
+        force_nonempty_content: true
+
+  # A second NVIDIA key (another account) — rotation target when profile 1 runs dry.
+  # 2:
+  #   name: nvidia-nemotron-ultra-b
+  #   base_url: https://integrate.api.nvidia.com/v1
+  #   api_key_env: NVIDIA_API_KEY_2
+  #   model: nvidia/nemotron-3-ultra-550b-a55b
+  #   context: 1000000
+  #   max_output: 16384
+  #   extra_body:
+  #     chat_template_kwargs: {enable_thinking: false, force_nonempty_content: true}
+
+  # Smaller, faster NVIDIA model on the same key.
+  # 3:
+  #   name: nvidia-nemotron-super
+  #   base_url: https://integrate.api.nvidia.com/v1
+  #   api_key_env: NVIDIA_API_KEY
+  #   model: nvidia/nemotron-3-super-120b-a12b
+  #   context: 1000000
+  #   max_output: 16384
+  #   extra_body:
+  #     chat_template_kwargs: {enable_thinking: false, force_nonempty_content: true}
+
+  # Keyless (no registration). Check tool calling with `ccrouter.py test 4` first.
+  # 4:
+  #   name: ovhcloud-anonymous
+  #   base_url: https://oai.endpoints.kepler.ai.cloud.ovh.net/v1
+  #   model: gpt-oss-120b
+  #   context: 128000
+
+  # 5:
+  #   name: pollinations
+  #   base_url: https://gen.pollinations.ai/v1
+  #   model: qwen-coder
+  #   context: 128000
+
+  # Paid or free-tier keyed providers work the same way:
+  # 6:
+  #   name: groq
+  #   base_url: https://api.groq.com/openai/v1
+  #   api_key_env: GROQ_API_KEY
+  #   model: openai/gpt-oss-120b
+  #   context: 131072
+  # 7:
+  #   name: openrouter
+  #   base_url: https://openrouter.ai/api/v1
+  #   api_key_env: OPENROUTER_API_KEY
+  #   model: nvidia/nemotron-3-ultra-550b-a55b:free
+  #   context: 1000000

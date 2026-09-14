@@ -9,3 +9,8 @@ CLAUDE.md
 # Internal working notes — never published to the public mirror
 gemma4-status.md
 narration.md
+
+# ccrouter: real keys and logs never leave this machine
+ccrouter/config.yaml
+ccrouter/logs/
+__pycache__/

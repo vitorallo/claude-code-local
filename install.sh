@@ -19,7 +19,7 @@ if ! command -v claude &>/dev/null; then
 fi
 
 # 1. Check/install uv
-echo "[1/3] Checking uv..."
+echo "[1/4] Checking uv..."
 if ! command -v uv &>/dev/null; then
     echo "  Installing uv via brew..."
     if ! command -v brew &>/dev/null; then
@@ -60,7 +60,7 @@ echo "  uv: $(uv --version)"
 # VLLM_MLX_REPO="git+https://github.com/vitorallo/vllm-mlx.git@claude-code-local-patches"               # older still
 VLLM_MLX_REPO="git+https://github.com/vitorallo/vllm-mlx.git@feat/claude-code-local-0.4.1"
 echo ""
-echo "[2/3] Installing vllm-mlx into local venv..."
+echo "[2/4] Installing vllm-mlx into local venv..."
 if [[ -d "$VENV_DIR" ]]; then
     echo "  Upgrading existing venv..."
     uv pip install --python "$VENV_DIR/bin/python3" --upgrade --force-reinstall "$VLLM_MLX_REPO"
@@ -80,9 +80,24 @@ else
     exit 1
 fi
 
-# 3. Create cclocal symlink
+# 3. ccrouter venv — the router behind `cclocal --ccrouter` (hosted providers
+# such as NVIDIA Nemotron). Tiny: httpx + PyYAML.
+CCROUTER_DIR="$SCRIPT_DIR/ccrouter"
 echo ""
-echo "[3/3] Creating cclocal command..."
+echo "[3/4] Setting up ccrouter..."
+if [[ ! -d "$CCROUTER_DIR/.venv" ]]; then
+    uv venv "$CCROUTER_DIR/.venv"
+fi
+uv pip install --python "$CCROUTER_DIR/.venv/bin/python3" -r "$CCROUTER_DIR/requirements.txt"
+if [[ ! -f "$CCROUTER_DIR/config.yaml" ]]; then
+    cp "$CCROUTER_DIR/config.example.yaml" "$CCROUTER_DIR/config.yaml"
+    chmod 600 "$CCROUTER_DIR/config.yaml"
+    echo "  Created ccrouter/config.yaml — add your API key(s) before using --ccrouter"
+fi
+
+# 4. Create cclocal symlink
+echo ""
+echo "[4/4] Creating cclocal command..."
 mkdir -p ~/.local/bin
 ln -sf "$SCRIPT_DIR/run.sh" ~/.local/bin/cclocal
 echo "  Symlinked: ~/.local/bin/cclocal -> $SCRIPT_DIR/run.sh"
@@ -101,6 +116,7 @@ echo "Quick start:"
 echo "  cclocal               # Interactive menu"
 echo "  cclocal --qwen38      # Qwen3.8-27B (~16GB, best quality, needs 24GB)"
 echo "  cclocal --gemma-light # Gemma-4-E4B (~5GB, light default, clean tool calling)"
+echo "  cclocal --ccrouter    # Hosted provider via ccrouter (edit ccrouter/config.yaml)"
 echo "  cclocal --server      # Server only, connect Claude Code separately"
 echo "  cclocal --clean       # List and delete cached models"
 echo "  cclocal -h            # All models and flags"

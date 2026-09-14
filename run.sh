@@ -1,7 +1,14 @@
 #!/bin/bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Follow symlinks first: install.sh links ~/.local/bin/cclocal -> run.sh, and
+# dirname "$0" alone would point at ~/.local/bin instead of this repo.
+_self="$0"
+while [[ -L "$_self" ]]; do
+    _link="$(readlink "$_self")"
+    if [[ "$_link" == /* ]]; then _self="$_link"; else _self="$(dirname "$_self")/$_link"; fi
+done
+SCRIPT_DIR="$(cd "$(dirname "$_self")" && pwd)"
 MCP_CONFIG="$SCRIPT_DIR/mcp-local.json"
 HF_CACHE="$HOME/.cache/huggingface/hub"
 
@@ -25,6 +32,12 @@ LMSTUDIO_URL="http://127.0.0.1:1234"
 # llama.cpp's server, Ollama, another Mac running this script with --server,
 # a vLLM box on a non-standard port.
 API_DEFAULT_PORT=8080
+
+# --ccrouter: a small local Python router (ccrouter/) that translates Claude
+# Code's Anthropic requests for OpenAI-compatible hosted providers — NVIDIA
+# Nemotron, Groq, OpenRouter, ... Profiles and keys live in ccrouter/config.yaml.
+CCROUTER_DIR="$SCRIPT_DIR/ccrouter"
+CCROUTER_PORT=8787
 
 # =============================================================================
 # Model catalog (single source of truth)
@@ -698,6 +711,11 @@ ${BOLD}Remote backend${RESET} ${DIM}(skip the local server, connect to a remote 
                   ${DIM}follow:  --api 192.168.1.50 8000${RESET}
   --remote URL    Any remote vLLM endpoint, e.g. http://host:8000
   --remote-model ID  Override model (default: auto-detect from /v1/models)
+  --ccrouter [N|R]
+                  Hosted providers (NVIDIA Nemotron, Groq, ...) through the
+                  ${DIM}local ccrouter on port $CCROUTER_PORT. N = profile number in${RESET}
+                  ${DIM}ccrouter/config.yaml (default 1), R = random. Stays on that${RESET}
+                  ${DIM}profile until it hits a rate/credit limit, then rotates.${RESET}
 
 ${BOLD}Other${RESET}
   -h, --help      Show this help
@@ -715,6 +733,8 @@ ${BOLD}Examples${RESET}
   cclocal --api 192.168.1.50  ${DIM}# any Anthropic-API box, port $API_DEFAULT_PORT${RESET}
   cclocal --dgx-active     ${DIM}# remote DGX Spark (MoE box)${RESET}
   cclocal --remote http://host:8000  ${DIM}# any remote vLLM box${RESET}
+  cclocal --ccrouter       ${DIM}# hosted provider, ccrouter profile 1${RESET}
+  cclocal --ccrouter R     ${DIM}# ...starting on a random profile${RESET}
 EOF
 }
 
@@ -756,6 +776,8 @@ REMOTE_URL=""      # set by --remote / --dgx-* ; empty = local vllm-mlx
 REMOTE_MODEL=""    # optional override; else auto-detected from /v1/models
 API_TARGET=""      # the raw --api argument, kept for the error message
 REMOTE_CTX=""      # remote's max_model_len, read from /v1/models
+REMOTE_MAX_OUT=""  # remote's max_output_tokens, if it advertises one (ccrouter does)
+CCROUTER_PROFILE="" # --ccrouter: profile number or R; empty = not using ccrouter
 EFFORT_LEVEL=""    # --effort; else derived from --think below
 ENABLE_THINKING=false   # --think: reasoning_effort=low instead of no thinking
 TOOL_PARSER="auto"      # resolved from the catalog once MODEL is known
@@ -808,6 +830,16 @@ while [[ $# -gt 0 ]]; do
             else
                 REMOTE_URL=$(_api_url "$API_TARGET") || exit 1
             fi
+            ;;
+        --ccrouter)
+            # --ccrouter [N|R]  profile number (default 1) or R for random
+            CCROUTER_PROFILE=1
+            if [[ $# -gt 1 && "$2" =~ ^([Rr]|[0-9]+)$ ]]; then
+                CCROUTER_PROFILE="$2"
+                shift
+            fi
+            REMOTE_URL="http://127.0.0.1:$CCROUTER_PORT"
+            shift
             ;;
         --think)         ENABLE_THINKING=true; shift ;;
         --effort)        EFFORT_LEVEL="$2"; shift 2 ;;
@@ -876,6 +908,60 @@ if ! command -v claude &>/dev/null; then
 fi
 
 # =============================================================================
+# ccrouter (local translating router for hosted providers)
+# =============================================================================
+# Started before the remote setup below, which then treats it like any other
+# remote: same health check, same /v1/models auto-detect.
+_stop_ccrouter() {
+    if [[ -n "${CCROUTER_PID:-}" ]]; then
+        printf "${DIM}Stopping ccrouter (pid: $CCROUTER_PID)...${RESET}\n"
+        kill "$CCROUTER_PID" 2>/dev/null || true
+        wait "$CCROUTER_PID" 2>/dev/null || true
+        CCROUTER_PID=""
+    fi
+}
+if [[ -n "$CCROUTER_PROFILE" ]]; then
+    CCROUTER_PY="$CCROUTER_DIR/.venv/bin/python3"
+    if [[ ! -x "$CCROUTER_PY" ]]; then
+        printf "${RED}ERROR: ccrouter venv not found. Run ./install.sh first.${RESET}\n"
+        exit 1
+    fi
+    if [[ ! -f "$CCROUTER_DIR/config.yaml" ]]; then
+        printf "${RED}ERROR: $CCROUTER_DIR/config.yaml not found.${RESET}\n"
+        echo "  cp $CCROUTER_DIR/config.example.yaml $CCROUTER_DIR/config.yaml && chmod 600 $CCROUTER_DIR/config.yaml"
+        echo "  then put your API key(s) in it."
+        exit 1
+    fi
+    if lsof -ti tcp:$CCROUTER_PORT -sTCP:LISTEN >/dev/null 2>&1; then
+        printf "${RED}ERROR: port $CCROUTER_PORT is already in use${RESET} (another cclocal --ccrouter session?).\n"
+        echo "  Each session runs its own router; close the other one first."
+        exit 1
+    fi
+    # Surface config errors here rather than in a log file.
+    "$CCROUTER_PY" "$CCROUTER_DIR/ccrouter.py" list >/dev/null || exit 1
+
+    mkdir -p "$CCROUTER_DIR/logs"
+    trap _stop_ccrouter EXIT   # replaced by cleanup() below, which also calls it
+    trap 'exit 143' TERM HUP   # a plain kill or a closed terminal must still run the EXIT trap
+    # --parent-pid: the router also exits by itself if this script dies uncleanly (kill -9).
+    "$CCROUTER_PY" "$CCROUTER_DIR/ccrouter.py" serve --profile "$CCROUTER_PROFILE" --port "$CCROUTER_PORT" \
+        --parent-pid $$ > "$CCROUTER_DIR/logs/stdout.log" 2>&1 &
+    CCROUTER_PID=$!
+    printf "${DIM}Starting ccrouter (profile $CCROUTER_PROFILE, pid $CCROUTER_PID, logs in $CCROUTER_DIR/logs)...${RESET}\n"
+    for _ in $(seq 1 30); do
+        if ! kill -0 "$CCROUTER_PID" 2>/dev/null; then
+            wait "$CCROUTER_PID" 2>/dev/null || true
+            CCROUTER_PID=""
+            printf "${RED}ERROR: ccrouter exited during startup:${RESET}\n"
+            tail -n 15 "$CCROUTER_DIR/logs/stdout.log"
+            exit 1
+        fi
+        if curl -s -m 1 "$REMOTE_URL/health" 2>/dev/null | grep -q healthy; then break; fi
+        sleep 0.5
+    done
+fi
+
+# =============================================================================
 # Remote backend setup (reachability + model auto-detect)
 # =============================================================================
 # BASE_URL is what Claude Code points ANTHROPIC_BASE_URL at — the local server
@@ -894,7 +980,9 @@ if [[ -n "$REMOTE_URL" ]]; then
     done
     if [[ "$reachable" != true ]]; then
         printf "${RED}ERROR: Cannot reach $REMOTE_URL/health (last status: ${http_code:-none}).${RESET}\n"
-        if [[ "$REMOTE_URL" == "$LMSTUDIO_URL" ]]; then
+        if [[ -n "$CCROUTER_PROFILE" ]]; then
+            echo "  - ccrouter did not come up. See $CCROUTER_DIR/logs/stdout.log"
+        elif [[ "$REMOTE_URL" == "$LMSTUDIO_URL" ]]; then
             echo "  - Is LM Studio's server running?  (lms server start)"
             echo "  - Is a model loaded?  (lms ps)"
             echo "  - LM Studio 0.4.1+ is required for the Anthropic /v1/messages endpoint."
@@ -935,6 +1023,12 @@ if [[ -n "$REMOTE_URL" ]]; then
         fi
     fi
     MODEL_NAME_DISPLAY="$MODEL"
+    if [[ -n "$CCROUTER_PROFILE" ]]; then
+        _upstream=$(printf '%s' "$models_json" \
+            | grep -oE '"upstream_model"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 \
+            | sed -E 's/.*:[[:space:]]*"([^"]*)".*/\1/' || true)
+        MODEL_NAME_DISPLAY="ccrouter → ${_upstream:-unknown}"
+    fi
     BASE_URL="$REMOTE_URL"
 
     # Context window. vLLM advertises max_model_len per model; LM Studio uses
@@ -943,6 +1037,10 @@ if [[ -n "$REMOTE_URL" ]]; then
     # wins if the box serves several models.
     REMOTE_CTX=$(printf '%s' "$models_json" \
         | grep -oE '"(max_model_len|max_context_length)"[[:space:]]*:[[:space:]]*[0-9]+' \
+        | grep -oE '[0-9]+$' | sort -n | head -1 || true)
+    # Output cap, when advertised (ccrouter reports the profile's max_output).
+    REMOTE_MAX_OUT=$(printf '%s' "$models_json" \
+        | grep -oE '"max_output_tokens"[[:space:]]*:[[:space:]]*[0-9]+' \
         | grep -oE '[0-9]+$' | sort -n | head -1 || true)
 else
     BASE_URL="http://127.0.0.1:$PORT"
@@ -989,8 +1087,10 @@ cleanup() {
         wait $SERVER_PID 2>/dev/null || true
         printf "${DIM}Done.${RESET}\n"
     fi
+    _stop_ccrouter
 }
 trap cleanup EXIT
+trap 'exit 143' TERM HUP   # so kill / a closed terminal still reverts the GPU limit and stops servers
 
 # --- Local server lifecycle (skipped entirely in remote mode) ---
 if [[ -z "$REMOTE_URL" ]]; then
@@ -1094,6 +1194,9 @@ if [[ -n "$REMOTE_URL" ]]; then
     CC_OUTPUT_DEFAULT=32000
     if [[ -n "$REMOTE_CTX" && $(( REMOTE_CTX / 4 )) -lt $CC_OUTPUT_DEFAULT ]]; then
         CC_OUTPUT_DEFAULT=$(( REMOTE_CTX / 4 ))
+    fi
+    if [[ -n "$REMOTE_MAX_OUT" && $REMOTE_MAX_OUT -lt $CC_OUTPUT_DEFAULT ]]; then
+        CC_OUTPUT_DEFAULT=$REMOTE_MAX_OUT
     fi
 else
     CC_OUTPUT_DEFAULT=8192
@@ -1394,7 +1497,10 @@ if [[ "$SERVER_ONLY" == true ]]; then
     done
     echo "    claude ${CLAUDE_FLAGS[*]}"
     echo ""
-    if [[ -n "$REMOTE_URL" ]]; then
+    if [[ -n "$CCROUTER_PROFILE" ]]; then
+        echo "ccrouter is running (logs: $CCROUTER_DIR/logs/). Press Ctrl+C to stop."
+        wait $CCROUTER_PID
+    elif [[ -n "$REMOTE_URL" ]]; then
         echo "(Remote server is managed elsewhere — nothing to keep alive here.)"
     else
         echo "Press Ctrl+C to stop."

@@ -544,6 +544,10 @@ cclocal --dgx-active                 # DGX Spark preset (MoE, faster)
 cclocal --dgx-idle                   # DGX Spark preset (dense, steadier)
 cclocal --api 192.168.1.50           # Any Anthropic-API box on your LAN (port 8080)
 cclocal --remote http://host:8000    # Any remote vLLM endpoint (model auto-detected)
+
+# Hosted providers (NVIDIA Nemotron free tier, Groq, OpenRouter...) via ccrouter
+cclocal --ccrouter                   # Profile 1 from ccrouter/config.yaml
+cclocal --ccrouter R                 # Random profile; rotates when one hits its limit
 ```
 
 Running `cclocal` with no arguments opens an interactive menu that shows every
@@ -686,6 +690,38 @@ cclocal --api 192.168.1.50 8000           # same, port as a separate argument
 > endpoint Claude Code uses, no request parameter disables thinking
 > (`thinking:{type:disabled}`, `reasoning_effort`, `chat_template_kwargs` are all
 > ignored there) — disable it **server-side on the remote box** if you need to.
+
+### Hosted providers via ccrouter (NVIDIA Nemotron, Groq, OpenRouter...)
+
+Several providers give away models far bigger than a Mac can run — NVIDIA's free
+developer tier serves **Nemotron 3 Ultra** (550B MoE, 1M context) — but they
+speak OpenAI `/v1/chat/completions`, not Anthropic `/v1/messages`.
+[`ccrouter/`](ccrouter/README.md) is a small Python router (two files, `httpx` +
+`PyYAML`, its own venv) that translates between the two, and `--ccrouter` runs
+it for the length of the session.
+
+```bash
+cp ccrouter/config.example.yaml ccrouter/config.yaml && chmod 600 ccrouter/config.yaml
+# put your key(s) in it, then:
+cclocal --ccrouter          # profile 1
+cclocal --ccrouter 2        # profile 2
+cclocal --ccrouter R        # random profile
+```
+
+- **Numbered profiles**, each one provider + key + model, in the gitignored
+  `ccrouter/config.yaml`. Keyless providers work too.
+- **Stays on its profile** until a request fails for hitting a limit (429, 402,
+  quota/credit errors), then rotates to another profile and retries that same
+  request — Claude Code doesn't see it.
+- **Everything is logged** in `ccrouter/logs/`: a human log, one JSON line per
+  request, and the full request/response bodies. Keys are never written.
+- It plugs into the remote path above: the launcher reads the profile's context
+  window and output cap from the router's `/v1/models`.
+- Expect the NVIDIA free tier to be slow when busy (45–110 s per request
+  observed) and capped around 40 requests/minute.
+
+Details, rotation rules, troubleshooting and a list of keyless providers:
+[ccrouter/README.md](ccrouter/README.md).
 
 ---
 
@@ -1734,6 +1770,7 @@ Every entry in the table below was first diagnosed that way.
 | `--effort LEVEL` | Effort Claude Code asks for: `low` (default), `medium` (with `--think`), `xhigh`, or `unset` to send nothing (see [#32](#32-400-unexpected-reasoning-effort-high)) |
 | `--lmstudio` | Point at LM Studio's server on this Mac instead of running vllm-mlx (see [Remote backend](#remote-backend-dgx-spark-or-any-vllm-box)) |
 | `--api HOST[:PORT]` | Point at any box serving the Anthropic Messages API; port defaults to 8080 (see [Remote backend](#remote-backend-dgx-spark-or-any-vllm-box)) |
+| `--ccrouter [N\|R]` | Start ccrouter on port 8787 with profile N (default 1) or a random one, and use hosted OpenAI-compatible providers (see [ccrouter](#hosted-providers-via-ccrouter-nvidia-nemotron-groq-openrouter)) |
 | `iogpu.wired_limit_mb` | Optionally raised via `sudo sysctl` by preflight option 2; **per-session only** — reverted on exit (prompts for sudo at shutdown if creds expired), and resets on reboot |
 
 ### Claude Code flags (set by run.sh)
@@ -1755,6 +1792,13 @@ claude-code-local/
   run.sh                    # Launcher — model catalog, memory preflight, starts vllm-mlx + Claude Code
   install.sh                # Setup — creates .venv, installs the vllm-mlx fork, symlinks cclocal
   mcp-local.json            # Empty MCP config (strips plugins for local sessions)
+  ccrouter/                 # Router to hosted OpenAI-compatible providers (--ccrouter)
+    ccrouter.py             #   CLI + server + profile rotation + logging
+    translate.py            #   Anthropic <-> OpenAI translation (pure functions)
+    config.example.yaml     #   Copy to config.yaml (gitignored) and add keys
+    README.md PRD.md PLAN.md
+    tests/                  #   unittest: translation + rotation against a fake upstream
+    logs/                   #   ccrouter.log, requests.jsonl, bodies/ (gitignored)
   docs/
     running-claude-code-on-local-llms.md   # Field report: every wall, root causes, honest limits
   server.log                # Last server run (rotated to server.log.1 … .5) — first place to look
