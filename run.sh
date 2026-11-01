@@ -12,16 +12,9 @@ SCRIPT_DIR="$(cd "$(dirname "$_self")" && pwd)"
 MCP_CONFIG="$SCRIPT_DIR/mcp-local.json"
 HF_CACHE="$HOME/.cache/huggingface/hub"
 
-# Remote backend presets — any box running vLLM or SGLang with the native
-# Anthropic Messages API (recent vLLM/SGLang both ship /v1/messages with real
-# tool_use blocks). Edit these to match your own boxes (Tailscale addresses
-# shown). Both point at a single box on two ports, not two boxes — only one
-# model runs at a time (unified memory) — so these mean "which model I last
-# started there", not "which box is free". Check what is actually serving
-# before using either: a port nothing listens on just fails the reachability
-# check.
-DGX_ACTIVE="http://100.96.179.64:8888"   # Qwen3.8-27B via SGLang+DFlash2 (fast, speculative decoding)
-DGX_IDLE="http://100.96.179.64:18300"    # Qwen3.8-Flash-Next (125B MoE, PLE mmap) via vLLM
+# Remote backend preset: a box running vLLM with the native Anthropic Messages
+# API. Edit this to match your own box (Tailscale address shown).
+SPARKFORGE_URL="${SPARKFORGE_URL:-http://100.96.179.64:8000}"   # Spark Forge on the DGX Spark, over Tailscale
 
 # LM Studio's local server. Since 0.4.1 it serves a native Anthropic
 # /v1/messages endpoint (SSE + tool calls), so it works with the same remote
@@ -48,7 +41,6 @@ MODEL_FLAGS=(
     "deckard"
     "gemma-light"
     "gemma"
-    "coder"
     "qwen3"
 )
 MODEL_IDS=(
@@ -56,7 +48,6 @@ MODEL_IDS=(
     "nightmedia/Qwen3.5-9B-Claude-GBO-Fire-Deckard-Agent-Heretic-dwq4-mlx"
     "mlx-community/gemma-4-e4b-it-4bit"
     "mlx-community/gemma-4-26b-a4b-it-4bit"
-    "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit"
     "mlx-community/Qwen3.5-9B-MLX-4bit"
 )
 MODEL_NAMES=(
@@ -64,7 +55,6 @@ MODEL_NAMES=(
     "Qwen3.5-9B-Deckard-Agent"
     "Gemma-4-E4B"
     "Gemma-4-26B-A4B MoE"
-    "Qwen3-Coder-30B-A3B"
     "Qwen3.5-9B"
 )
 MODEL_SIZES=(
@@ -72,7 +62,6 @@ MODEL_SIZES=(
     "6GB"
     "5GB"
     "16GB"
-    "18GB"
     "5GB"
 )
 MODEL_DESCS=(
@@ -80,7 +69,6 @@ MODEL_DESCS=(
     "Agent-tuned, fast, writes real files — 16GB+ RAM"
     "Light default, clean tool calling — 16GB+ RAM"
     "Google MoE, 3.8B active — 24GB+ RAM"
-    "Heavier code model — 24GB+ RAM"
     "Base Qwen3.5, verified working — 16GB+ RAM"
 )
 # Tool-call parser per model. Qwen 3.5 / 3.8 / 3-Coder emit XML tool calls
@@ -93,7 +81,6 @@ MODEL_PARSERS=(
     "qwen3_xml"
     "gemma4"
     "gemma4"
-    "qwen3_xml"
     "qwen3_xml"
 )
 # Reasoning parser applied REGARDLESS of --think, for models whose thinking
@@ -111,7 +98,6 @@ MODEL_REASONING=(
     ""
     "gemma4"
     "gemma4"
-    ""
     "qwen3"
 )
 # Per-sequence KV cache bound (--max-kv-size). Empty = engine default.
@@ -125,7 +111,6 @@ MODEL_KV_SIZES=(
     "32768"
     "65536"
     "65536"
-    "32768"
     "32768"
     "65536"
 )
@@ -674,9 +659,7 @@ ${BOLD}Model flags${RESET}
   --deckard       Qwen3.5-9B-Deckard-Agent (~6GB, agent-tuned, fast)
   --gemma-light   Gemma-4-E4B (~5GB, default, clean tool calling)
   --gemma         Gemma-4-26B-A4B MoE (~16GB)
-  --coder         Qwen3-Coder-30B-A3B (~18GB)
   --qwen3         Qwen3.5-9B stock (~5GB; --deckard is the fixed fine-tune)
-  --light         Alias for --gemma-light (back-compat with v2.0.1)
   --model ID      Use a custom HuggingFace MLX model ID
 
 ${BOLD}Commands${RESET}
@@ -700,8 +683,9 @@ ${BOLD}Server options${RESET}
                   ${DIM}template rejects outright — hence the low default here.${RESET}
 
 ${BOLD}Remote backend${RESET} ${DIM}(skip the local server, connect to a remote vLLM box)${RESET}
-  --dgx-active    DGX Spark preset ${DIM}($DGX_ACTIVE)${RESET}
-  --dgx-idle      DGX Spark preset ${DIM}($DGX_IDLE)${RESET}
+  --sparkforge    Spark Forge on the DGX Spark ${DIM}($SPARKFORGE_URL)${RESET}
+                  ${DIM}Tuned for it: caching markers on, no write-in-sections rule.${RESET}
+                  ${DIM}Override the address with SPARKFORGE_URL.${RESET}
   --lmstudio      LM Studio on this Mac ${DIM}($LMSTUDIO_URL)${RESET}
                   ${DIM}Needs LM Studio 0.4.1+ (native Anthropic /v1/messages);${RESET}
                   ${DIM}start it with \`lms server start\`.${RESET}
@@ -740,7 +724,7 @@ ${BOLD}Examples${RESET}
   cclocal --qwen38 --think ${DIM}# ...with brief reasoning enabled${RESET}
   cclocal --lmstudio       ${DIM}# use LM Studio's server on this Mac${RESET}
   cclocal --api 192.168.1.50  ${DIM}# any Anthropic-API box, port $API_DEFAULT_PORT${RESET}
-  cclocal --dgx-active     ${DIM}# remote DGX Spark (MoE box)${RESET}
+  cclocal --sparkforge     ${DIM}# Spark Forge on the DGX Spark${RESET}
   cclocal --remote http://host:8000  ${DIM}# any remote vLLM box${RESET}
   cclocal --ccrouter       ${DIM}# hosted provider, choose the profile from a menu${RESET}
   cclocal --ccrouter 1     ${DIM}# ...straight to profile 1${RESET}
@@ -783,12 +767,13 @@ MODEL=""
 MODEL_NAME_DISPLAY=""
 PORT=8000
 SERVER_ONLY=false
-REMOTE_URL=""      # set by --remote / --dgx-* ; empty = local vllm-mlx
+REMOTE_URL=""      # set by --remote / --sparkforge ; empty = local vllm-mlx
 REMOTE_MODEL=""    # optional override; else auto-detected from /v1/models
 API_TARGET=""      # the raw --api argument, kept for the error message
 REMOTE_CTX=""      # remote's max_model_len, read from /v1/models
 REMOTE_MAX_OUT=""  # remote's max_output_tokens, if it advertises one (ccrouter does)
 CCROUTER_PROFILE="" # --ccrouter: profile number or R; empty = not using ccrouter
+USE_SPARKFORGE=false # --sparkforge: the Spark Forge preset
 USE_CHROME=false   # --chrome: keep Claude in Chrome's browser tools (off by default)
 MCP_MODE=none      # --mcp: your usual MCP servers/plugins · --mcp-config FILE: only those
 MCP_USER_CONFIG="" # the FILE given to --mcp-config
@@ -800,18 +785,8 @@ MAX_KV_SIZE=""          # resolved from the catalog; empty = engine default
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --coder|--gemma|--gemma-light|--deckard|--qwen3|--qwen38)
+        --gemma|--gemma-light|--deckard|--qwen3|--qwen38)
             idx=$(find_by_flag "${1#--}")
-            MODEL="${MODEL_IDS[$idx]}"
-            MODEL_NAME_DISPLAY="${MODEL_NAMES[$idx]}"
-            shift
-            ;;
-        --light)
-            # Backward-compat alias: v2.0.1 default was Qwen3.5-9B which leaks
-            # plain-text thinking. v2.0.2 default is Gemma-4-E4B — clean tool
-            # calling via the fork's gemma4_tool_parser + channel-cleanup
-            # patches.
-            idx=$(find_by_flag "gemma-light")
             MODEL="${MODEL_IDS[$idx]}"
             MODEL_NAME_DISPLAY="${MODEL_NAMES[$idx]}"
             shift
@@ -825,8 +800,7 @@ while [[ $# -gt 0 ]]; do
         --server)  SERVER_ONLY=true; shift ;;
         --remote)        REMOTE_URL="$2"; shift 2 ;;
         --remote-model)  REMOTE_MODEL="$2"; shift 2 ;;
-        --dgx-active)    REMOTE_URL="$DGX_ACTIVE"; shift ;;
-        --dgx-idle)      REMOTE_URL="$DGX_IDLE"; shift ;;
+        --sparkforge)    REMOTE_URL="$SPARKFORGE_URL"; USE_SPARKFORGE=true; shift ;;
         --lmstudio)      REMOTE_URL="$LMSTUDIO_URL"; shift ;;
         --api)
             # --api HOST[:PORT]  (default port $API_DEFAULT_PORT)
@@ -1013,7 +987,7 @@ fi
 # Remote backend setup (reachability + model auto-detect)
 # =============================================================================
 # BASE_URL is what Claude Code points ANTHROPIC_BASE_URL at — the local server
-# by default, or the remote box when --remote/--dgx-* is used.
+# by default, or the remote box when --remote/--sparkforge is used.
 if [[ -n "$REMOTE_URL" ]]; then
     REMOTE_URL="${REMOTE_URL%/}"   # strip trailing slash
 
@@ -1030,6 +1004,10 @@ if [[ -n "$REMOTE_URL" ]]; then
         printf "${RED}ERROR: Cannot reach $REMOTE_URL/health (last status: ${http_code:-none}).${RESET}\n"
         if [[ -n "$CCROUTER_PROFILE" ]]; then
             echo "  - ccrouter did not come up. See $CCROUTER_DIR/logs/stdout.log"
+        elif [[ "$USE_SPARKFORGE" == true ]]; then
+            echo "  - Is Tailscale up on both ends?  (tailscale status)"
+            echo "  - Is the backend running?  On the Spark: ~/.local/bin/sparkforge status"
+            echo "    A cold start takes about 7 minutes."
         elif [[ "$REMOTE_URL" == "$LMSTUDIO_URL" ]]; then
             echo "  - Is LM Studio's server running?  (lms server start)"
             echo "  - Is a model loaded?  (lms ps)"
@@ -1357,8 +1335,12 @@ CLAUDE_FLAGS=(
     # blocked). Tool set stays scoped to these 8 via --tools above; nothing
     # outside the list is auto-approved.
     --allowedTools "Bash,Read,Edit,Write,Glob,Grep,WebSearch,WebFetch"
-    --append-system-prompt "$_WRITE_IN_PARTS_GUIDANCE"
 )
+# Spark Forge takes Claude Code's full 32000-token output, so the rule would only
+# split writes into more round trips there.
+if [[ "$USE_SPARKFORGE" != true ]]; then
+    CLAUDE_FLAGS+=(--append-system-prompt "$_WRITE_IN_PARTS_GUIDANCE")
+fi
 # Claude in Chrome adds ~22 browser tools (~14k tokens) to every request, and
 # --strict-mcp-config doesn't strip them — it isn't an MCP server. Off unless
 # --chrome is passed.
@@ -1377,8 +1359,9 @@ esac
 # Anthropic's cache_control markers, so Claude Code is told not to send them.
 # ccrouter's providers cache automatically on a repeated prompt prefix (the
 # markers are ignored), so leave caching on there — it also silences Claude
-# Code's "Prompt caching off" warning.
-if [[ -z "$CCROUTER_PROFILE" ]]; then
+# Code's "Prompt caching off" warning. Spark Forge's vLLM behaves the same way:
+# it accepts the markers, ignores them, and reuses the prefix on its own either way.
+if [[ -z "$CCROUTER_PROFILE" && "$USE_SPARKFORGE" != true ]]; then
     CLAUDE_ENV+=("DISABLE_PROMPT_CACHING=1")
 fi
 

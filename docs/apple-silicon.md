@@ -129,18 +129,8 @@ says so when that happens, and `./run.sh` works regardless.
 | `--deckard` | Qwen3.5-9B-Deckard-Agent | ~6GB | 16GB+ | **Best all-rounder here.** Agent-tuned, fast, writes real files [4] |
 | *(default)* `--gemma-light` | Gemma-4-E4B | ~5GB | 16GB+ | Clean tool calling, verified end-to-end |
 | `--gemma` | Gemma-4-26B-A4B MoE | ~14GB | 24GB | **Best fit for 24GB.** MoE, 3.8B active — 14GB class but prefills fast enough to skip the cache entirely [3] |
-| `--coder` | Qwen3-Coder-30B-A3B | ~18GB | **32GB+** | Heavier code model — **untested here** [5] |
 | `--qwen3` | Qwen3.5-9B (stock) | ~5GB | 16GB+ | Base model behind `--deckard`. **Now working** — the old thinking leak is gone [1] |
-| `--light` | *(alias)* | | | Back-compat alias for `--gemma-light` (v2.0.1 pointed at Qwen3.5-9B) |
 | `--model ID` | Any MLX model | varies | varies | Custom HuggingFace model ID (not tested) |
-
-[5] `--coder` has never been downloaded or run on this machine. At 18GB it is
-larger than `--qwen38`, which *is* documented as hitting a Metal OOM in real
-sessions on 24GB ([#26](#26-qwen38-on-24gb-the-honest-verdict)) — so on a 24GB
-Mac expect it to fail the same way. It may well be fine on 32GB+, and being a
-~3B-active MoE it could behave like `--gemma`, which prefills fast enough to
-sidestep the prefix-cache doubling that kills dense Qwen3.8. Untested either
-way; treat the row as a starting point, not a recommendation.
 
 **Removed:** `--coder7b` (Qwen2.5-Coder-7B) and `--review` (GLM-4.7-Flash).
 The first has unreliable tool calls [2], and a model that can't call tools
@@ -514,7 +504,6 @@ cclocal --qwen38       # Direct launch, Qwen3.8-27B (best quality, 24GB)
 cclocal --gemma-light  # Direct launch, Gemma-4-E4B (light default, clean tool calling)
 cclocal --gemma        # Direct launch, Gemma-4-26B MoE (best big model on 24GB)
 cclocal --qwen3        # Direct launch, stock Qwen3.5-9B
-cclocal --coder        # Direct launch, Qwen3-Coder-30B-A3B (untested, 32GB+)
 cclocal --list         # List cached models on disk
 cclocal --rm           # Manage/delete cached models (interactive)
 cclocal --server       # Start server only, connect Claude Code separately
@@ -530,8 +519,7 @@ cclocal --ccrouter --mcp-config mcp-playwright.json   # Load only the servers in
 
 # Remote backend — run the model on another box, not this Mac
 cclocal --lmstudio                   # LM Studio's server on this Mac (needs 0.4.1+)
-cclocal --dgx-active                 # DGX Spark preset (MoE, faster)
-cclocal --dgx-idle                   # DGX Spark preset (dense, steadier)
+cclocal --sparkforge                 # Spark Forge on the DGX Spark, over Tailscale
 cclocal --api 192.168.1.50           # Any Anthropic-API box on your LAN (port 8080)
 cclocal --remote http://host:8000    # Any remote vLLM endpoint (model auto-detected)
 
@@ -609,8 +597,7 @@ menu, no `.venv` check, no memory preflight, no download/serve) and points
 `ANTHROPIC_BASE_URL` at the remote.
 
 ```bash
-cclocal --dgx-active                      # preset: MoE box (faster)
-cclocal --dgx-idle                        # preset: dense box (steadier reasoning)
+cclocal --sparkforge                      # preset: Spark Forge on the DGX Spark
 cclocal --remote http://host:8000         # any remote vLLM endpoint
 cclocal --remote http://host:8000 --remote-model Qwen/Qwen3.6-35B-A3B   # override model
 
@@ -621,9 +608,9 @@ cclocal --api 192.168.1.50 8000           # same, port as a separate argument
 
 - **Auto-detect.** With no `--remote-model`, the launcher reads the model id
   from the remote's `/v1/models` and uses it automatically.
-- **Presets.** `--dgx-active` / `--dgx-idle` are convenience aliases — edit the
-  `DGX_ACTIVE` / `DGX_IDLE` addresses near the top of `run.sh` to match your own
-  boxes.
+- **Preset.** `--sparkforge` is a convenience alias tuned for Spark Forge — set
+  `SPARKFORGE_URL`, or edit its address near the top of `run.sh`, to match your
+  own box.
 - **`--api HOST[:PORT]`** is the same thing without a preset, for a box you
   reach by address rather than by name: it builds the URL for you and defaults
   the port to **8080** (`API_DEFAULT_PORT` in `run.sh`). Everything downstream —
@@ -1732,7 +1719,7 @@ Every entry in the table below was first diagnosed that way.
 
 | Variable | Value | Purpose |
 |----------|-------|---------|
-| `ANTHROPIC_BASE_URL` | `http://127.0.0.1:8000` (local) or the remote URL with `--remote`/`--dgx-*` | Point Claude Code at the server |
+| `ANTHROPIC_BASE_URL` | `http://127.0.0.1:8000` (local) or the remote URL with `--remote`/`--sparkforge` | Point Claude Code at the server |
 | `ANTHROPIC_AUTH_TOKEN` | `not-needed` | Dummy credential, so no Anthropic account or login is needed (real keys explicitly unset). A token rather than `ANTHROPIC_API_KEY`, which would trigger the "Detected a custom API key" question on a fresh install |
 | `ANTHROPIC_MODEL` | Full HuggingFace ID | Model identifier |
 | `ANTHROPIC_DEFAULT_*_MODEL` | Same as above | Route all tiers (Opus/Sonnet/Haiku) locally |

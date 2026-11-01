@@ -140,6 +140,7 @@ another Mac:
 ```bash
 cclocal --lmstudio               # LM Studio on this Mac
 cclocal --api 192.168.1.50       # anything serving /v1/messages (port 8080)
+cclocal --sparkforge             # Spark Forge on the DGX Spark, over Tailscale
 cclocal --remote http://host:8000
 ```
 
